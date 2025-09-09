@@ -36,8 +36,8 @@ MIN_STD_VALUES = {
     'WinStreak': 0.5, 'UnbeatenStreak': 0.5, 'LossStreak': 0.5,
     'WinRate5': 0.1, 'WinRate10': 0.1, 'PointsRate5': 0.1, 'PointsRate10': 0.1,
     'RestDays': 1.0, 'RecentForm': 0.2, 'GoalDifference': 0.5,
-    'CleanSheetRate': 0.05, 'ScoringRate': 0.05, 'AvgGoalsFor': 0.2, 'AvgGoalsAgainst': 0.2,
-    'HomeAdvantage': 0.1, 'OpponentStrength': 0.2, 'SeasonProgress': 0.1
+    'CleanSheetRate': 0.05, 'ScoringRate': 0.05, 'AvgGoalsFor': 0.2,
+    'HomeAdvantage': 0.1, 'SeasonProgress': 0.1
 }
 
 # Uitgebreide initiele gewichten
@@ -52,8 +52,8 @@ WEIGHTS = {
     'WinStreak': 1.2, 'UnbeatenStreak': 0.8, 'LossStreak': -1.0,
     'WinRate5': 1.5, 'WinRate10': 1.0, 'PointsRate5': 1.3, 'PointsRate10': 0.9,
     'RestDays': 0.3, 'RecentForm': 1.1, 'GoalDifference': 0.9,
-    'CleanSheetRate': 0.7, 'ScoringRate': 0.8, 'AvgGoalsFor': 1.0, 'AvgGoalsAgainst': -1.0,
-    'HomeAdvantage': 0.5, 'OpponentStrength': -0.6, 'SeasonProgress': 0.2
+    'CleanSheetRate': 0.7, 'ScoringRate': 0.8, 'AvgGoalsFor': 1.0,
+    'HomeAdvantage': 0.5, 'SeasonProgress': 0.2
 }
 
 ML_WEIGHTS = WEIGHTS.copy()
@@ -189,7 +189,7 @@ def calculate_historical_features(df):
             'WinStreak': 0, 'UnbeatenStreak': 0, 'LossStreak': 0,
             'WinRate5': 0, 'WinRate10': 0, 'PointsRate5': 0, 'PointsRate10': 0,
             'RestDays': 7, 'RecentForm': 0, 'GoalDifference': 0,
-            'CleanSheetRate': 0, 'ScoringRate': 0, 'AvgGoalsFor': 0, 'AvgGoalsAgainst': 0
+            'CleanSheetRate': 0, 'ScoringRate': 0, 'AvgGoalsFor': 0
         }
         return {k: pd.Series([v]) for k, v in default_features.items()}
     
@@ -236,7 +236,6 @@ def calculate_historical_features(df):
     clean_sheet_rates = []
     scoring_rates = []
     avg_goals_for = []
-    avg_goals_against = []
     rest_days = []
     
     for i in range(n):
@@ -303,22 +302,22 @@ def calculate_historical_features(df):
                     form_score += 1 * weights[j]
         recent_forms.append(form_score)
         
-        # Goal difference (cumulative)
-        gf_cum = sum(goals_for[:i+1])
-        ga_cum = sum(goals_against[:i+1])
-        goal_diffs.append(gf_cum - ga_cum)
+        # Goal difference (only for the last 7 matches, not cumulative)
+        start_idx = max(0, i - 6)  # Last 7 matches including current
+        gf_sum = sum(goals_for[start_idx:i+1])
+        ga_sum = sum(goals_against[start_idx:i+1])
+        goal_diffs.append(gf_sum - ga_sum)
         
-        # Clean sheet rate
-        clean_sheets = sum(1 for ga in goals_against[:i+1] if ga == 0)
-        clean_sheet_rates.append(clean_sheets / max(1, i+1))
+        # Clean sheet rate (only for the last 7 matches)
+        clean_sheets = sum(1 for j in range(start_idx, i+1) if goals_against[j] == 0)
+        clean_sheet_rates.append(clean_sheets / max(1, i+1 - start_idx))
         
-        # Scoring rate (games with goals)
-        scoring_games = sum(1 for gf in goals_for[:i+1] if gf > 0)
-        scoring_rates.append(scoring_games / max(1, i+1))
+        # Scoring rate (games with goals, only for the last 7 matches)
+        scoring_games = sum(1 for j in range(start_idx, i+1) if goals_for[j] > 0)
+        scoring_rates.append(scoring_games / max(1, i+1 - start_idx))
         
-        # Average goals
-        avg_goals_for.append(sum(goals_for[:i+1]) / max(1, i+1))
-        avg_goals_against.append(sum(goals_against[:i+1]) / max(1, i+1))
+        # Average goals for (only for the last 7 matches)
+        avg_goals_for.append(sum(goals_for[start_idx:i+1]) / max(1, i+1 - start_idx))
         
         # Rest days
         if date_col and i > 0:
@@ -345,7 +344,6 @@ def calculate_historical_features(df):
     features['CleanSheetRate'] = pd.Series(clean_sheet_rates)
     features['ScoringRate'] = pd.Series(scoring_rates)
     features['AvgGoalsFor'] = pd.Series(avg_goals_for)
-    features['AvgGoalsAgainst'] = pd.Series(avg_goals_against)
     
     return features
 
@@ -450,26 +448,57 @@ def build_enhanced_feature_series(df, team_name):
     feats = {}
     minutes = pd.Series([90.0] * n)
 
-    # Existing basic features (unchanged)
+    # Verbeterde kolomdetectie met meer specifieke zoekpatronen
     xg_col = find_column_flexible(df, [['expected_xg_shooting'], ['xg_shooting'], ['xg'], ['npxg_shooting'], ['npxg']])
-    sh_col = find_column_flexible(df, [['standard_sh_shooting'], ['sh_shooting'], ['sh'], ['shots']])
-    sot_col = find_column_flexible(df, [['standard_sot_shooting'], ['sot_shooting'], ['sot'], ['shots on target']])
+    sh_col = find_column_flexible(df, [['standard_sh_shooting'], ['sh_shooting'], ['sh'], ['shots'], ['total', 'shots']])
+    sot_col = find_column_flexible(df, [['standard_sot_shooting'], ['sot_shooting'], ['sot'], ['shots on target'], ['on target']])
     goals_col = find_column_flexible(df, [['standard_gls_shooting'], ['gls_shooting'], ['gf_shooting'], ['gf'], ['goals'], ['gls'], ['for_', 'gf'], ['_gf_']])
-    prgp_col = find_column_flexible(df, [['prgp_passing'], ['prgr_possession'], ['prgp'], ['progressive']])
-    prgdist_col = find_column_flexible(df, [['total_prgdist_passing'], ['prgdist_possession'], ['prgdist'], ['progressive', 'distance']])
-    setpieces_col = find_column_flexible(df, [['standard_fk_shooting'], ['fk_shooting'], ['pass types_ck_passing_types'], ['ck_passing_types'], ['fk_passing_types'], ['corner'], ['free', 'kick'], ['setpiece']])
+    
+    # Progressive passing - verbeterde detectie
+    prgp_col = find_column_flexible(df, [['prgp_passing'], ['prgr_possession'], ['prgp'], ['progressive', 'passes']])
+    prgdist_col = find_column_flexible(df, [['total_prgdist_passing'], ['prgdist_possession'], ['prgdist'], ['progressive', 'distance'], ['pass', 'prgdist']])
+    
+    # Set pieces - focus op corners
+    setpieces_col = find_column_flexible(df, [['pass types_ck_passing_types'], ['ck_passing_types'], ['corner', 'kicks'], ['corners'], ['ck']])
+    
+    # Attacking third touches
     att3rd_col = find_column_flexible(df, [['touches_att 3rd_possession'], ['touches_att_3rd_possession'], ['att_3rd_possession'], ['att_3rd'], ['att', '3rd']])
-    poss_col = find_column_flexible(df, [['for cf montrÃ©al_poss_possession'], ['for_', 'poss_possession'], ['poss_possession'], ['possession'], ['poss']])
+    
+    # Possession - verbeterde detectie
+    poss_col = find_column_flexible(df, [['poss_possession'], ['possession'], ['poss', '%'], ['possession', '%']])
+    
+    # Goalkeeper features - verbeterde detectie
     sota_col = find_column_flexible(df, [['performance_sota_keeper'], ['sota_keeper'], ['sota'], ['shots on target against']])
     saves_col = find_column_flexible(df, [['performance_saves_keeper'], ['saves_keeper'], ['saves']])
     psxg_col = find_column_flexible(df, [['performance_psxg_keeper'], ['psxg_keeper'], ['psxg']])
-    aerial_win_col = find_column_flexible(df, [['aerial duels_won%_misc'], ['wonpct_misc'], ['won_misc'], ['aerial', 'won'], ['aerial', '%'], ['duel']])
-    def3rd_col = find_column_flexible(df, [['tackles_def 3rd_defense'], ['def_3rd_defense'], ['tackles_att 3rd_defense'], ['att_3rd_defense'], ['def_3rd'], ['defensive', '3rd']])
+    
+    # Aerial duels - verbeterde detectie
+    aerial_win_col = find_column_flexible(df, [
+        ['aerial duels_won%_misc'], 
+        ['won%_misc'], 
+        ['aerial', 'won%'], 
+        ['aerial', '%'], 
+        ['duel', 'won%'],
+        ['aerial', 'won', '%'],
+        ['aerial', 'success', '%'],
+        ['aerial', 'duels', '%']
+    ])
+    
+    # Defensive actions
+    def3rd_col = find_column_flexible(df, [['tackles_def 3rd_defense'], ['def_3rd_defense'], ['defensive', '3rd']])
     int_col = find_column_flexible(df, [['performance_int_misc'], ['int_misc'], ['interceptions'], ['int']])
-    tkldpct_col = find_column_flexible(df, [['tkldpct_possession'], ['tkld%']])
-    wonpct_col = find_column_flexible(df, [['wonpct_misc'], ['aerial', 'won%'], ['duel', '%']])
-    att3rddef_col = find_column_flexible(df, [['att_3rd_defense'], ['att', '3rd', 'defense']])
-    savepct_col = find_column_flexible(df, [['savepct_keeper'], ['cmppct_keeper'], ['save', '%']])
+    
+    # Tackled percentage
+    tkldpct_col = find_column_flexible(df, [['tkldpct_possession'], ['tkld%_possession'], ['tackled', '%']])
+    
+    # Won percentage
+    wonpct_col = find_column_flexible(df, [['won%_misc'], ['duels', 'won%'], ['won', '%']])
+    
+    # Attacking third defense
+    att3rddef_col = find_column_flexible(df, [['tackles_att 3rd_defense'], ['att_3rd_defense'], ['attacking', '3rd', 'tackles']])
+    
+    # Save percentage - verbeterde detectie
+    savepct_col = find_column_flexible(df, [['save%_keeper'], ['savepct_keeper'], ['save', '%'], ['performance_save%_keeper']])
 
     # Basic features (per 90 minutes)
     def per90(col):
@@ -479,6 +508,7 @@ def build_enhanced_feature_series(df, team_name):
     feats['Sh90'] = per90(sh_col)
     feats['SoT90'] = per90(sot_col)
 
+    # Shot quality calculation
     sh_safe = series_to_numeric(df[sh_col].replace(0, np.nan)) if sh_col else pd.Series([1.0] * n)
     feats['ShotQual'] = 0.6 * (series_to_numeric(df[xg_col]) / sh_safe).fillna(0.0) + 0.4 * (series_to_numeric(df[sot_col]) / sh_safe).fillna(0.0)
     feats['Goals'] = series_to_numeric(df[goals_col]).fillna(0.0) if goals_col else pd.Series([0.0] * n)
@@ -489,6 +519,7 @@ def build_enhanced_feature_series(df, team_name):
     if ga_col:
         feats['GoalsAgainst'] = series_to_numeric(df[ga_col]).fillna(0.0)
     else:
+        # Fallback: try to extract from result column
         res_col = find_column_flexible(df, [['result'], ['score'], ['result_shooting']])
         parsed_ga = []
         if res_col:
@@ -526,21 +557,59 @@ def build_enhanced_feature_series(df, team_name):
     feats['SetPieces90'] = per90(setpieces_col)
     feats['Att3rd90'] = per90(att3rd_col)
 
+    # Possession handling
     poss_raw = series_to_numeric(df[poss_col]) if poss_col else pd.Series([0.0] * n)
-    feats['Possession'] = poss_raw / 100.0 if poss_raw.max() > 1.5 else poss_raw
+    if poss_raw.max() > 1.5:  # Likely percentage (0-100)
+        feats['Possession'] = poss_raw / 100.0
+    else:  # Already decimal (0-1)
+        feats['Possession'] = poss_raw
 
     feats['SoTA90'] = per90(sota_col)
     feats['SaveRate'] = (series_to_numeric(df[saves_col]) / series_to_numeric(df[sota_col])).fillna(0.0) if saves_col and sota_col else pd.Series([0.0] * n)
     feats['PSxG'] = series_to_numeric(df[psxg_col]).fillna(0.0) if psxg_col else pd.Series([0.0] * n)
 
-    feats['AerialWin%'] = series_to_numeric(df[aerial_win_col]).fillna(0.0) if aerial_win_col else pd.Series([0.0] * n)
-    feats['HighPress'] = per90(def3rd_col) if def3rd_col else (per90(int_col) if int_col else pd.Series([0.0] * n))
+    # Aerial win percentage handling
+    if aerial_win_col:
+        aerial_raw = series_to_numeric(df[aerial_win_col])
+        # Check if values are percentages (typically 0-100) or decimals (0-1)
+        if aerial_raw.max() > 1.5:  # Likely percentage
+            feats['AerialWin%'] = aerial_raw / 100.0
+        else:  # Already decimal
+            feats['AerialWin%'] = aerial_raw
+    else:
+                # Als aerial win percentage niet wordt gevonden, probeer dan wonpct_col als fallback
+        if wonpct_col:
+            won_raw = series_to_numeric(df[wonpct_col])
+            if won_raw.max() > 1.5:  # Likely percentage
+                feats['AerialWin%'] = won_raw / 100.0
+            else:  # Already decimal
+                feats['AerialWin%'] = won_raw
+        else:
+            feats['AerialWin%'] = pd.Series([0.0] * n)
 
-    # Additional basic features
-    feats['TkldPct_possession'] = series_to_numeric(df[tkldpct_col]).fillna(0.0) if tkldpct_col else pd.Series([0.0] * n)
-    feats['WonPct_misc'] = series_to_numeric(df[wonpct_col]).fillna(0.0) if wonpct_col else pd.Series([0.0] * n)
-    feats['Att_3rd_defense'] = series_to_numeric(df[att3rddef_col]).fillna(0.0) if att3rddef_col else pd.Series([0.0] * n)
-    feats['SavePct_keeper'] = series_to_numeric(df[savepct_col]).fillna(0.0) if savepct_col else pd.Series([0.0] * n)
+    # High press - use defensive actions in attacking third
+    feats['HighPress'] = per90(att3rddef_col) if att3rddef_col else pd.Series([0.0] * n)
+
+    # Additional basic features with percentage handling
+    if tkldpct_col:
+        tkld_raw = series_to_numeric(df[tkldpct_col])
+        feats['TkldPct_possession'] = tkld_raw / 100.0 if tkld_raw.max() > 1.5 else tkld_raw
+    else:
+        feats['TkldPct_possession'] = pd.Series([0.0] * n)
+
+    if wonpct_col:
+        won_raw = series_to_numeric(df[wonpct_col])
+        feats['WonPct_misc'] = won_raw / 100.0 if won_raw.max() > 1.5 else won_raw
+    else:
+        feats['WonPct_misc'] = pd.Series([0.0] * n)
+
+    feats['Att_3rd_defense'] = per90(att3rddef_col) if att3rddef_col else pd.Series([0.0] * n)
+
+    if savepct_col:
+        save_raw = series_to_numeric(df[savepct_col])
+        feats['SavePct_keeper'] = save_raw / 100.0 if save_raw.max() > 1.5 else save_raw
+    else:
+        feats['SavePct_keeper'] = pd.Series([0.0] * n)
 
     # Add historical performance features
     historical_feats = calculate_historical_features(df)
@@ -575,7 +644,7 @@ def make_enhanced_delta(team_feats, opp_feats):
         # New historical features
         'WinStreak', 'UnbeatenStreak', 'LossStreak', 'WinRate5', 'WinRate10', 
         'PointsRate5', 'PointsRate10', 'RestDays', 'RecentForm', 'GoalDifference',
-        'CleanSheetRate', 'ScoringRate', 'AvgGoalsFor', 'AvgGoalsAgainst',
+        'CleanSheetRate', 'ScoringRate', 'AvgGoalsFor',
         'SeasonProgress', 'HomeAdvantage'
     ]
     
@@ -600,15 +669,6 @@ def make_enhanced_delta(team_feats, opp_feats):
                               ema(opp_feats.get('AerialWin%', pd.Series([0.0]))))
     delta['KeeperPSxGdiff'] = (ema(team_feats.get('PSxG', pd.Series([0.0]))), 
                               ema(opp_feats.get('PSxG', pd.Series([0.0]))))
-    
-    # Enhanced opponent strength calculation
-    opp_strength = (
-        ema(opp_feats.get('WinRate10', pd.Series([0.0]))) * 0.4 +
-        ema(opp_feats.get('PointsRate10', pd.Series([0.0]))) * 0.3 +
-        ema(opp_feats.get('GoalDifference', pd.Series([0.0]))) * 0.2 +
-        ema(opp_feats.get('RecentForm', pd.Series([0.0]))) * 0.1
-    )
-    delta['OpponentStrength'] = (0.0, opp_strength)  # Only opponent strength matters
 
     return delta
 
@@ -1148,7 +1208,7 @@ if __name__ == '__main__':
     
     elif choice == "4":
         print("\nBatch Analyse (toekomstige uitbreiding)")
-        print("Deze functie wordt in een volgende versie geïmplementeerd.")
+        print("Deze functie wordt in a volgende versie geïmplementeerd.")
     
     else:
         print("Ongeldige keuze. Kies 1, 2, 3 of 4.")
