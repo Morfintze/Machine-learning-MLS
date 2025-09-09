@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-enhanced_ml_soccer_predictor.py
-Uitgebreide versie met meer features: winst/verlies streaks, rustdagen, seizoenscontext, etc.
+enhanced_ml_soccer_predictor_xgboost.py
+Uitgebreide versie met XGBoost model voor betere voorspellingen en minder gelijkspel-bias
 """
 
 import pandas as pd
@@ -11,19 +11,26 @@ import pickle
 from datetime import datetime, timedelta
 from tkinter import Tk
 from tkinter.filedialog import askopenfilename
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, classification_report
-from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.utils.class_weight import compute_class_weight
+import xgboost as xgb
+from scipy.stats import mode
+import seaborn as sns
+import matplotlib.pyplot as plt
 
 # -------------------------
-# Enhanced Config
+# Enhanced Config with XGBoost
 # -------------------------
 EMA_SPAN = 7
 SCALE_TO_SCORE = 4.0
 MODEL_FILE = "enhanced_soccer_model.pkl"
+XGBOOST_MODEL_FILE = "enhanced_xgboost_model.pkl"
 SCALER_FILE = "enhanced_scaler.pkl"
 WEIGHTS_FILE = "enhanced_dynamic_weights.pkl"
+LABEL_ENCODER_FILE = "label_encoder.pkl"
 
 # Uitgebreide minimum standard deviations
 MIN_STD_VALUES = {
@@ -40,26 +47,43 @@ MIN_STD_VALUES = {
     'HomeAdvantage': 0.1, 'SeasonProgress': 0.1
 }
 
-# Uitgebreide initiele gewichten
+# Uitgebreide initiele gewichten - aangepast voor gelijkspel-bias
 WEIGHTS = {
-    # Bestaande weights
+    # Bestaande weights met aanpassingen
     'xG90': 1.1, 'Sh90': 1.6, 'SoT90': 0.8, 'ShotQual': 1.5, 'ConvRatio90': 1.8,
     'Goals': 0.8, 'Prog90': 0.35, 'PrgDist90': 0.25, 'Att3rd90': 0.6,
-    'FieldTilt': 0.8, 'HighPress': 0.95, 'AerialMismatch': 0.6, 'Possession': 0.35,
+    'FieldTilt': 0.9, 'HighPress': 0.95, 'AerialMismatch': 0.6, 'Possession': 0.4,  # Verhoogd
     'KeeperPSxGdiff': -0.44, 'GoalsAgainst': -2.481, 'TkldPct_possession': 0.4,
-    'WonPct_misc': 0.4, 'Att_3rd_defense': 0.8, 'SavePct_keeper': 0.2,
-    # Nieuwe weights
-    'WinStreak': 1.2, 'UnbeatenStreak': 0.8, 'LossStreak': -1.0,
-    'WinRate5': 1.5, 'WinRate10': 1.0, 'PointsRate5': 1.3, 'PointsRate10': 0.9,
-    'RestDays': 0.3, 'RecentForm': 1.1, 'GoalDifference': 0.9,
-    'CleanSheetRate': 0.7, 'ScoringRate': 0.8, 'AvgGoalsFor': 1.0,
-    'HomeAdvantage': 0.5, 'SeasonProgress': 0.2
+    'WonPct_misc': 0.4, 'Att_3rd_defense': 0.8, 'SavePct_keeper': 0.3,  # Verhoogd
+    # Nieuwe weights - aangepast om gelijkspel te verminderen
+    'WinStreak': 1.4, 'UnbeatenStreak': 0.7, 'LossStreak': -1.2,  # Meer extreme waardering
+    'WinRate5': 1.7, 'WinRate10': 1.1, 'PointsRate5': 1.5, 'PointsRate10': 1.0,  # Verhoogd
+    'RestDays': 0.4, 'RecentForm': 1.3, 'GoalDifference': 1.1,  # Verhoogd
+    'CleanSheetRate': 0.8, 'ScoringRate': 0.9, 'AvgGoalsFor': 1.2,  # Verhoogd
+    'HomeAdvantage': 0.6, 'SeasonProgress': 0.2
 }
 
 ML_WEIGHTS = WEIGHTS.copy()
 
+# XGBoost parameters - geoptimaliseerd tegen gelijkspel-bias
+XGBOOST_PARAMS = {
+    'objective': 'multi:softprob',
+    'num_class': 3,
+    'eval_metric': 'mlogloss',
+    'max_depth': 8,
+    'min_child_weight': 3,
+    'subsample': 0.8,
+    'colsample_bytree': 0.8,
+    'learning_rate': 0.1,
+    'n_estimators': 300,
+    'random_state': 42,
+    'reg_alpha': 0.1,
+    'reg_lambda': 0.1,
+    'scale_pos_weight': 1.2  # Helpt bij class imbalance
+}
+
 # -------------------------
-# Enhanced Helper Functions
+# Enhanced Helper Functions (same as before)
 # -------------------------
 def choose_file(prompt):
     Tk().withdraw()
@@ -151,7 +175,7 @@ def extract_match_result_from_string(result_str, goals_for=None):
         return 'L'
     else:
         # Probeer scoreformaten zoals "2-1"
-        score_match = re.match(r'(\d+)\s*[-—:\u2013]\s*(\d+)', result_str)
+        score_match = re.match(r'(\d+)\s*[-â€":\u2013]\s*(\d+)', result_str)
         if score_match:
             home_goals = int(score_match.group(1))
             away_goals = int(score_match.group(2))
@@ -176,7 +200,7 @@ def extract_match_result_from_string(result_str, goals_for=None):
     return None
 
 # -------------------------
-# Enhanced Feature Engineering
+# Enhanced Feature Engineering (same as before)
 # -------------------------
 def calculate_historical_features(df):
     """Berekent historische prestatie-features."""
@@ -529,7 +553,7 @@ def build_enhanced_feature_series(df, team_name):
                 if pd.isna(res_val): 
                     res_val = ''
                 res_str = str(res_val)
-                mres = re.search(r'(\d+)\s*[-—:\u2013]\s*(\d+)', res_str)
+                mres = re.search(r'(\d+)\s*[-â€":\u2013]\s*(\d+)', res_str)
                 if mres:
                     a = float(mres.group(1))
                     b = float(mres.group(2))
@@ -577,7 +601,7 @@ def build_enhanced_feature_series(df, team_name):
         else:  # Already decimal
             feats['AerialWin%'] = aerial_raw
     else:
-                # Als aerial win percentage niet wordt gevonden, probeer dan wonpct_col als fallback
+        # Als aerial win percentage niet wordt gevonden, probeer dan wonpct_col als fallback
         if wonpct_col:
             won_raw = series_to_numeric(df[wonpct_col])
             if won_raw.max() > 1.5:  # Likely percentage
@@ -622,7 +646,7 @@ def build_enhanced_feature_series(df, team_name):
     return feats
 
 # -------------------------
-# Enhanced EMA and Delta Functions
+# Enhanced EMA and Delta Functions (mostly same as before)
 # -------------------------
 def ema(series, span=EMA_SPAN):
     """Enhanced EMA with better handling of edge cases."""
@@ -673,12 +697,12 @@ def make_enhanced_delta(team_feats, opp_feats):
     return delta
 
 def compute_enhanced_weighted_score(delta_dict, use_ml_weights=False):
-    """Enhanced scoring with improved z-score calculation and feature weighting."""
+    """Enhanced scoring met betere gelijkspel-bias correctie."""
     z_team = {}
     z_opp = {}
     contribs = {}
 
-    print(f"\n--- Enhanced Z-Score Calculation ---")
+    print(f"\n--- Enhanced Z-Score Calculation (Anti-Draw Bias) ---")
     print(f"{'Feature':<20} | {'Home EMA':<10} | {'Away EMA':<10} | {'Diff':<8} | {'Std':<8} | {'Z-Diff':<8} | {'Weight':<8} | {'Contrib':<8}")
     print("-" * 100)
 
@@ -690,42 +714,40 @@ def compute_enhanced_weighted_score(delta_dict, use_ml_weights=False):
         combined = np.array([t_ema, o_ema])
         mean, std = np.nanmean(combined), np.nanstd(combined)
         
-        # Enhanced robust_std calculation with feature-specific minimums
-        robust_std = max(std, min_std, abs(mean) * 0.15, 0.3)
+        # Enhanced robust_std calculation met anti-draw bias
+        robust_std = max(std, min_std, abs(mean) * 0.12, 0.25)  # Verlaagd voor meer spreiding
         
         zt = (t_ema - mean) / robust_std
         zo = (o_ema - mean) / robust_std
         
-        # Adaptive clipping based on feature type
+        # Meer agressieve clipping voor minder gelijkspellen
         if feat in ['WinStreak', 'UnbeatenStreak', 'LossStreak', 'RestDays']:
-            # More tolerance for streak/contextual features
-            zt = np.clip(zt, -3.0, 3.0)
-            zo = np.clip(zo, -3.0, 3.0)
+            zt = np.clip(zt, -3.5, 3.5)  # Meer extreme waarden toegestaan
+            zo = np.clip(zo, -3.5, 3.5)
         else:
-            # Standard clipping for performance features
-            zt = np.clip(zt, -2.5, 2.5)
-            zo = np.clip(zo, -2.5, 2.5)
+            zt = np.clip(zt, -3.0, 3.0)  # Verhoogd van -2.5, 2.5
+            zo = np.clip(zo, -3.0, 3.0)
         
         z_team[feat] = zt
         z_opp[feat] = zo
         
         weight = weights_to_use.get(feat, 0.0)
         
-        # Enhanced contribution calculation with feature-specific scaling
+        # Enhanced contribution met anti-draw bias
         raw_contrib = weight * (zt - zo)
         
-        # Feature-specific scaling factors
+        # Anti-draw scaling factors
         if feat in ['WinRate5', 'WinRate10', 'PointsRate5', 'PointsRate10', 'RecentForm']:
-            # Recent performance features get enhanced impact
-            scaling_factor = 1.2
+            scaling_factor = 1.4  # Verhoogd van 1.2
+        elif feat in ['WinStreak', 'LossStreak', 'GoalDifference']:
+            scaling_factor = 1.3  # Nieuwe categorie voor extremere features
         elif feat in ['RestDays', 'SeasonProgress']:
-            # Contextual features get reduced impact
             scaling_factor = 0.8
         else:
-            scaling_factor = 1.0
+            scaling_factor = 1.1  # Verhoogd van 1.0
         
-        # Apply scaling and soft clipping
-        contribs[feat] = raw_contrib * scaling_factor * np.tanh(abs(raw_contrib) / 4.0) / max(abs(raw_contrib), 1e-6)
+        # Minder agressieve soft clipping
+        contribs[feat] = raw_contrib * scaling_factor * np.tanh(abs(raw_contrib) / 3.0) / max(abs(raw_contrib), 1e-6)  # Verlaagd van 4.0 naar 3.0
         
         diff = t_ema - o_ema
         z_diff = zt - zo
@@ -738,22 +760,173 @@ def compute_enhanced_weighted_score(delta_dict, use_ml_weights=False):
 
     weighted_diff = sum(contribs.values())
     
-    # Enhanced scaling with adaptive range
-    max_expected_diff = 15.0  # Increased to account for more features
+    # Anti-draw bias scaling
+    max_expected_diff = 12.0  # Verlaagd van 15.0 voor meer spreiding
     scaled_diff = max_expected_diff * np.tanh(weighted_diff / max_expected_diff)
     
-    final = 50.0 + SCALE_TO_SCORE * scaled_diff
+    # Base score met meer extreme scaling
+    final = 50.0 + SCALE_TO_SCORE * 1.2 * scaled_diff  # 20% meer extreme scores
     
-    # Dynamic capping based on confidence
+    # Dynamic capping met bredere range
     confidence = min(1.0, len([c for c in contribs.values() if abs(c) > 0.1]) / 10.0)
-    cap_range = 30 + confidence * 25  # Range from 30-55 to 30-80 based on confidence
+    cap_range = 35 + confidence * 30  # Range van 35-65 naar 35-95
     
-    final = np.clip(final, 30.0, 70.0 + cap_range)
+    final = np.clip(final, 25.0, 75.0 + cap_range)  # Bredere range: 25-100+
     
     return final, scaled_diff, z_team, z_opp, contribs
 
 # -------------------------
-# Enhanced ML Functions
+# NEW: XGBoost Functions
+# -------------------------
+def create_draw_penalty_weights(y):
+    """Creëer aangepaste class weights om gelijkspel-bias te verminderen."""
+    classes = np.unique(y)
+    
+    # Manual weights - penaliseer draws harder
+    class_weights = {}
+    for cls in classes:
+        if cls == 'D':
+            class_weights[cls] = 0.6  # Verminderd gewicht voor draws
+        elif cls == 'W':
+            class_weights[cls] = 1.2  # Verhoogd gewicht voor wins
+        else:  # 'L'
+            class_weights[cls] = 1.2  # Verhoogd gewicht voor losses
+    
+    return class_weights
+
+def train_xgboost_model(X, y):
+    """Train een XGBoost model met anti-draw bias."""
+    if len(X) < 10:
+        print(f"Onvoldoende data voor XGBoost training: {len(X)} samples. Minimum 10 vereist.")
+        return None, None, None
+    
+    # Label encoding
+    le = LabelEncoder()
+    y_encoded = le.fit_transform(y)
+    
+    # Split the data
+    test_size = min(0.3, max(0.1, len(X) * 0.2 / len(X)))
+    X_train, X_test, y_train, y_test = train_test_split(X, y_encoded, test_size=test_size, random_state=42, stratify=y_encoded)
+    
+    # Scale features
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+    
+    # Custom class weights om draw bias te verminderen
+    original_labels = le.inverse_transform(y_train)
+    class_weights = create_draw_penalty_weights(original_labels)
+    sample_weights = np.array([class_weights[le.inverse_transform([label])[0]] for label in y_train])
+    
+    # XGBoost model met aangepaste parameters
+    xgb_model = xgb.XGBClassifier(**XGBOOST_PARAMS)
+    
+    # Train met sample weights - aangepast voor nieuwere XGBoost versies
+    try:
+        # Probeer eerst met eval_set en callbacks (nieuwere versies)
+        xgb_model.fit(
+            X_train_scaled, 
+            y_train,
+            sample_weight=sample_weights,
+            eval_set=[(X_test_scaled, y_test)],
+            callbacks=[xgb.callback.EarlyStopping(rounds=50, save_best=True)],
+            verbose=False
+        )
+    except TypeError:
+        # Fallback voor oudere versies of andere configuraties
+        xgb_model.fit(
+            X_train_scaled, 
+            y_train,
+            sample_weight=sample_weights,
+            verbose=False
+        )
+    
+    # Predictions
+    y_pred = xgb_model.predict(X_test_scaled)
+    y_prob = xgb_model.predict_proba(X_test_scaled)
+    
+    # Evaluate
+    accuracy = accuracy_score(y_test, y_pred)
+    
+    print(f"\nXGBoost Model Performance:")
+    print(f"Nauwkeurigheid: {accuracy:.3f}")
+    print(f"Training samples: {len(X_train)}, Test samples: {len(X_test)}")
+    
+    # Convert back to original labels for report
+    y_test_original = le.inverse_transform(y_test)
+    y_pred_original = le.inverse_transform(y_pred)
+    
+    print("\nXGBoost Classificatie Rapport:")
+    print(classification_report(y_test_original, y_pred_original))
+    
+    # Confusion Matrix
+    cm = confusion_matrix(y_test_original, y_pred_original, labels=['W', 'D', 'L'])
+    print(f"\nConfusion Matrix:")
+    print(f"{'':>8} {'W':>8} {'D':>8} {'L':>8}")
+    for i, true_label in enumerate(['W', 'D', 'L']):
+        print(f"{true_label:>8} {cm[i][0]:>8} {cm[i][1]:>8} {cm[i][2]:>8}")
+    
+    # Feature importance
+    feature_names = X.columns.tolist()
+    importances = xgb_model.feature_importances_
+    feature_importance_df = pd.DataFrame({
+        'feature': feature_names,
+        'importance': importances
+    }).sort_values('importance', ascending=False)
+    
+    print(f"\nTop 15 XGBoost Features:")
+    print(feature_importance_df.head(15))
+    
+    # Cross-validation score
+    cv_scores = cross_val_score(xgb_model, X_train_scaled, y_train, cv=3, scoring='accuracy')
+    print(f"\nCross-validation scores: {cv_scores}")
+    print(f"CV Mean: {cv_scores.mean():.3f} (+/- {cv_scores.std() * 2:.3f})")
+    
+    return xgb_model, scaler, le
+
+def ensemble_prediction(rf_model, xgb_model, rf_scaler, xgb_scaler, label_encoder, features):
+    """Combineer Random Forest en XGBoost voorspellingen."""
+    features_df = pd.DataFrame([features])
+    
+    # Random Forest prediction
+    rf_features_scaled = rf_scaler.transform(features_df)
+    rf_prediction = rf_model.predict(rf_features_scaled)[0]
+    rf_probabilities = rf_model.predict_proba(rf_features_scaled)[0]
+    
+    # XGBoost prediction  
+    xgb_features_scaled = xgb_scaler.transform(features_df)
+    xgb_prediction_encoded = xgb_model.predict(xgb_features_scaled)[0]
+    xgb_prediction = label_encoder.inverse_transform([xgb_prediction_encoded])[0]
+    xgb_probabilities = xgb_model.predict_proba(xgb_features_scaled)[0]
+    
+    # Convert XGB probabilities to same order as RF (W, D, L)
+    xgb_classes = label_encoder.inverse_transform(range(len(label_encoder.classes_)))
+    xgb_prob_dict = dict(zip(xgb_classes, xgb_probabilities))
+    xgb_probs_ordered = [xgb_prob_dict.get(cls, 0) for cls in ['W', 'D', 'L']]
+    
+    # Ensemble weighting - meer gewicht naar XGBoost vanwege anti-draw bias
+    rf_weight = 0.4
+    xgb_weight = 0.6
+    
+    ensemble_probs = [
+        rf_weight * rf_probabilities[0] + xgb_weight * xgb_probs_ordered[0],  # Win
+        rf_weight * rf_probabilities[1] + xgb_weight * xgb_probs_ordered[1],  # Draw
+        rf_weight * rf_probabilities[2] + xgb_weight * xgb_probs_ordered[2]   # Loss
+    ]
+    
+    ensemble_prediction = ['W', 'D', 'L'][np.argmax(ensemble_probs)]
+    
+    return {
+        'rf_prediction': rf_prediction,
+        'rf_probabilities': rf_probabilities,
+        'xgb_prediction': xgb_prediction,
+        'xgb_probabilities': xgb_probs_ordered,
+        'ensemble_prediction': ensemble_prediction,
+        'ensemble_probabilities': ensemble_probs
+    }
+
+# -------------------------
+# Enhanced ML Functions (updated for XGBoost)
 # -------------------------
 def extract_match_result_enhanced(df):
     """Enhanced result extraction with better error handling."""
@@ -786,7 +959,7 @@ def prepare_enhanced_ml_features(home_feats, away_feats):
     # Combine features
     combined_features = {**home_ema, **away_ema}
     
-    # Add difference and ratio features
+    # Add difference and ratio features - crucial voor model prestatie
     for key in home_feats.keys():
         if key in away_feats:
             home_val = home_ema.get(f"home_{key}", 0)
@@ -799,12 +972,14 @@ def prepare_enhanced_ml_features(home_feats, away_feats):
             else:
                 combined_features[f"ratio_{key}"] = home_val if abs(home_val) > 1e-6 else 1.0
     
-    # Add interaction features for key metrics
+    # Add interaction features voor sleutel metrics
     key_interactions = [
         ('WinRate5', 'RecentForm'),
         ('GoalDifference', 'AvgGoalsFor'),
         ('CleanSheetRate', 'SavePct_keeper'),
-        ('RestDays', 'WinStreak')
+        ('RestDays', 'WinStreak'),
+        ('xG90', 'ShotQual'),  # Nieuwe interactie
+        ('Possession', 'FieldTilt')  # Nieuwe interactie
     ]
     
     for feat1, feat2 in key_interactions:
@@ -816,14 +991,43 @@ def prepare_enhanced_ml_features(home_feats, away_feats):
     
     return combined_features
 
-def train_enhanced_model(X, y):
-    """Enhanced model training with better hyperparameters."""
+def train_dual_models(X, y):
+    """Train zowel Random Forest als XGBoost modellen."""
     if len(X) < 10:
         print(f"Onvoldoende data voor training: {len(X)} samples. Minimum 10 vereist.")
-        return None, None
+        return None, None, None, None, None
     
-    # Split the data
-    test_size = min(0.3, max(0.1, len(X) * 0.2 / len(X)))  # Adaptive test size
+    print("Training Random Forest model...")
+    rf_model, rf_scaler = train_enhanced_rf_model(X, y)
+    
+    print("\nTraining XGBoost model...")
+    xgb_model, xgb_scaler, label_encoder = train_xgboost_model(X, y)
+    
+    if rf_model is not None and xgb_model is not None:
+        # Save alle modellen
+        with open(MODEL_FILE, 'wb') as f:
+            pickle.dump(rf_model, f)
+        
+        with open(XGBOOST_MODEL_FILE, 'wb') as f:
+            pickle.dump(xgb_model, f)
+        
+        with open(SCALER_FILE, 'wb') as f:
+            pickle.dump({'rf_scaler': rf_scaler, 'xgb_scaler': xgb_scaler}, f)
+            
+        with open(LABEL_ENCODER_FILE, 'wb') as f:
+            pickle.dump(label_encoder, f)
+        
+        print(f"\nAlle modellen opgeslagen!")
+        print(f"Random Forest: {MODEL_FILE}")
+        print(f"XGBoost: {XGBOOST_MODEL_FILE}")
+        print(f"Scalers: {SCALER_FILE}")
+        print(f"Label Encoder: {LABEL_ENCODER_FILE}")
+    
+    return rf_model, xgb_model, rf_scaler, xgb_scaler, label_encoder
+
+def train_enhanced_rf_model(X, y):
+    """Train Random Forest met aangepaste parameters."""
+    test_size = min(0.3, max(0.1, len(X) * 0.2 / len(X)))
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_size, random_state=42, stratify=y)
     
     # Scale features
@@ -831,14 +1035,18 @@ def train_enhanced_model(X, y):
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
     
-    # Enhanced Random Forest with better parameters
+    # Custom class weights voor draw penalty
+    class_weights = create_draw_penalty_weights(y_train)
+    
+    # Enhanced Random Forest
     model = RandomForestClassifier(
-        n_estimators=200,  # More trees
-        max_depth=15,      # Prevent overfitting
-        min_samples_split=5,
+        n_estimators=250,  # Meer bomen
+        max_depth=18,      # Dieper voor meer complexiteit
+        min_samples_split=4,
         min_samples_leaf=2,
         random_state=42,
-        class_weight='balanced'  # Handle class imbalance
+        class_weight=class_weights,  # Custom weights
+        max_features='sqrt'
     )
     
     model.fit(X_train_scaled, y_train)
@@ -847,148 +1055,77 @@ def train_enhanced_model(X, y):
     y_pred = model.predict(X_test_scaled)
     accuracy = accuracy_score(y_test, y_pred)
     
-    print(f"Enhanced Model Nauwkeurigheid: {accuracy:.3f}")
+    print(f"Random Forest Nauwkeurigheid: {accuracy:.3f}")
     print(f"Training samples: {len(X_train)}, Test samples: {len(X_test)}")
-    print("\nClassificatie Rapport:")
+    print("\nRandom Forest Classificatie Rapport:")
     print(classification_report(y_test, y_pred))
-    
-    # Feature importance analysis
-    feature_names = X.columns.tolist()
-    importances = model.feature_importances_
-    feature_importance_df = pd.DataFrame({
-        'feature': feature_names,
-        'importance': importances
-    }).sort_values('importance', ascending=False)
-    
-    print("\nTop 15 Belangrijkste Features:")
-    print(feature_importance_df.head(15))
-    
-    # Update weights
-    update_enhanced_weights_from_model(model, feature_names)
-    
-    # Save model and scaler
-    with open(MODEL_FILE, 'wb') as f:
-        pickle.dump(model, f)
-    
-    with open(SCALER_FILE, 'wb') as f:
-        pickle.dump(scaler, f)
-    
-    print(f"Enhanced model opgeslagen als {MODEL_FILE}")
-    print(f"Enhanced scaler opgeslagen als {SCALER_FILE}")
     
     return model, scaler
 
-def update_enhanced_weights_from_model(model, feature_names):
-    """Enhanced weight update with better feature mapping."""
-    global ML_WEIGHTS
-    
-    if not hasattr(model, 'feature_importances_'):
-        return
-    
-    feature_importance = model.feature_importances_
-    
-    # Create importance mapping
-    importance_map = {}
-    for i, feature_name in enumerate(feature_names):
-        # Extract base feature name
-        base_feature = None
-        
-        # Handle different feature name patterns
-        for feat in ML_WEIGHTS.keys():
-            patterns = [
-                f"diff_{feat}",
-                f"ratio_{feat}", 
-                f"home_{feat}",
-                f"away_{feat}",
-                f"interaction_home_{feat}_",
-                f"interaction_away_{feat}_",
-                f"interaction_diff_{feat}_"
-            ]
-            
-            if any(pattern in feature_name for pattern in patterns):
-                base_feature = feat
-                break
-        
-        if base_feature:
-            if base_feature not in importance_map:
-                importance_map[base_feature] = []
-            importance_map[base_feature].append(feature_importance[i])
-    
-    # Update weights with combined importance
-    for base_feature, importances in importance_map.items():
-        if base_feature in ML_WEIGHTS:
-            avg_importance = np.mean(importances)
-            max_importance = max(feature_importance)
-            
-            if max_importance > 0:
-                normalized_importance = avg_importance / max_importance
-                
-                # Combine with existing weight (60% ML, 40% expert knowledge)
-                ML_WEIGHTS[base_feature] = (
-                    0.6 * normalized_importance * 2.0 +  # Scale ML importance
-                    0.4 * WEIGHTS[base_feature]
-                )
-    
-    # Save updated weights
-    with open(WEIGHTS_FILE, 'wb') as f:
-        pickle.dump(ML_WEIGHTS, f)
-    
-    print("Enhanced gewichten bijgewerkt en opgeslagen")
-
-def load_enhanced_model():
-    """Enhanced model loading with better error handling."""
+def load_all_models():
+    """Laad alle modellen voor ensemble voorspelling."""
     try:
         with open(MODEL_FILE, 'rb') as f:
-            model = pickle.load(f)
+            rf_model = pickle.load(f)
         
-        with open(SCALER_FILE, 'rb') as f:
-            scaler = pickle.load(f)
+        with open(XGBOOST_MODEL_FILE, 'rb') as f:
+            xgb_model = pickle.load(f)
             
-        # Try to load enhanced weights
-        try:
-            with open(WEIGHTS_FILE, 'rb') as f:
-                global ML_WEIGHTS
-                ML_WEIGHTS = pickle.load(f)
-            print("Enhanced model, scaler en gewichten succesvol geladen")
-        except FileNotFoundError:
-            print("Enhanced model en scaler geladen, default gewichten gebruikt")
+        with open(SCALER_FILE, 'rb') as f:
+            scalers = pickle.load(f)
+            if isinstance(scalers, dict):
+                rf_scaler = scalers['rf_scaler']
+                xgb_scaler = scalers['xgb_scaler']
+            else:
+                # Backward compatibility
+                rf_scaler = xgb_scaler = scalers
         
-        return model, scaler
+        with open(LABEL_ENCODER_FILE, 'rb') as f:
+            label_encoder = pickle.load(f)
+        
+        print("Alle modellen succesvol geladen!")
+        return rf_model, xgb_model, rf_scaler, xgb_scaler, label_encoder
+        
     except FileNotFoundError as e:
-        print(f"Enhanced model niet gevonden: {e}")
-        return None, None
+        print(f"Model niet gevonden: {e}")
+        return None, None, None, None, None
 
-def enhanced_combined_prediction(ml_prediction, ml_probabilities, statistical_score):
+def ultimate_combined_prediction(ensemble_results, statistical_score):
     """
-    Enhanced prediction combining with better statistical score tempering
-    and more sophisticated probability combination.
+    Ultimate prediction die ensemble ML + statistical score combineert
+    met betere anti-draw bias.
     """
-    
-    def enhanced_temper_score(score):
-        """More sophisticated score tempering."""
-        if score < 35:
-            return 35 + (score - 35) * 0.2
-        elif score > 75:
-            return 75 + (score - 75) * 0.3
-        elif score < 42:
-            return 42 + (score - 42) * 0.5
-        elif score > 68:
-            return 68 + (score - 68) * 0.6
+    def anti_draw_temper_score(score):
+        """Score tempering met anti-draw bias."""
+        # Meer extreme scores om draws te vermijden
+        if score < 40:
+            return 35 + (score - 40) * 0.8
+        elif score > 60:
+            return 65 + (score - 60) * 0.8
+        elif 45 <= score <= 55:
+            # "Dead zone" - push away from draw territory
+            center = 50
+            distance = abs(score - center)
+            if distance < 3:  # Very close to 50
+                direction = 1 if score >= center else -1
+                return center + direction * 6  # Push to 56 or 44
+            else:
+                return score + (3 if score > center else -3)
         else:
             return score
     
-    tempered_score = enhanced_temper_score(statistical_score)
+    tempered_score = anti_draw_temper_score(statistical_score)
     
-    # Convert to probabilities with more nuanced mapping
-    if tempered_score > 50:
-        stat_win_prob = min(0.75, max(0.15, (tempered_score - 45) / 20))
-        stat_loss_prob = max(0.05, min(0.4, (55 - tempered_score) / 25))
+    # Convert naar kansen met anti-draw bias
+    if tempered_score > 52:
+        stat_win_prob = min(0.80, max(0.20, (tempered_score - 40) / 25))
+        stat_loss_prob = max(0.05, min(0.35, (60 - tempered_score) / 30))
     else:
-        stat_win_prob = max(0.05, min(0.4, (tempered_score - 35) / 25))
-        stat_loss_prob = min(0.75, max(0.15, (55 - tempered_score) / 20))
+        stat_win_prob = max(0.05, min(0.35, (tempered_score - 30) / 30))
+        stat_loss_prob = min(0.80, max(0.20, (60 - tempered_score) / 25))
     
-    stat_draw_prob = 1.0 - stat_win_prob - stat_loss_prob
-    stat_draw_prob = max(0.15, stat_draw_prob)  # Minimum draw probability
+    # Zeer lage draw probability
+    stat_draw_prob = max(0.08, 1.0 - stat_win_prob - stat_loss_prob)  # Maximum 8% draw
     
     # Renormalize
     total = stat_win_prob + stat_draw_prob + stat_loss_prob
@@ -997,53 +1134,71 @@ def enhanced_combined_prediction(ml_prediction, ml_probabilities, statistical_sc
         stat_draw_prob /= total
         stat_loss_prob /= total
     
-    # Dynamic weighting based on score reliability and ML confidence
-    ml_confidence = max(ml_probabilities) - np.mean(ml_probabilities)
+    # Dynamic weighting gebaseerd op ensemble confidence
+    ensemble_probs = ensemble_results['ensemble_probabilities']
+    ml_confidence = max(ensemble_probs) - np.mean(ensemble_probs)
     score_extremity = abs(statistical_score - 50) / 25.0
     
-    # More ML weight when ML is confident and score is not extreme
-    if ml_confidence > 0.2 and score_extremity < 0.6:
-        ml_weight = 0.7
+    # Meer ML gewicht als het confident is EN minder draw voorspelt
+    ml_draw_penalty = 1.0 - ensemble_probs[1]  # Minder draw = meer vertrouwen
+    
+    if ml_confidence > 0.25 and ml_draw_penalty > 0.7:
+        ml_weight = 0.75  # Zeer confident ML
+        stat_weight = 0.25
+    elif ml_confidence > 0.15 and score_extremity > 0.6:
+        ml_weight = 0.7   # Confident ML + extreme score
         stat_weight = 0.3
-    elif score_extremity > 0.8:  # Very extreme scores
-        ml_weight = 0.8
-        stat_weight = 0.2
-    elif ml_confidence < 0.1:  # ML not confident
-        ml_weight = 0.5
-        stat_weight = 0.5
-    else:
+    elif ensemble_probs[1] < 0.25:  # ML voorspelt weinig draw
         ml_weight = 0.65
         stat_weight = 0.35
+    else:
+        ml_weight = 0.6   # Default
+        stat_weight = 0.4
     
-    # Combine probabilities
-    combined_probs = (
-        ml_weight * ml_probabilities[0] + stat_weight * stat_win_prob,
-        ml_weight * ml_probabilities[1] + stat_weight * stat_draw_prob,  
-        ml_weight * ml_probabilities[2] + stat_weight * stat_loss_prob
-    )
+    # Final combination
+    final_probs = [
+        ml_weight * ensemble_probs[0] + stat_weight * stat_win_prob,  # Win
+        ml_weight * ensemble_probs[1] + stat_weight * stat_draw_prob,  # Draw
+        ml_weight * ensemble_probs[2] + stat_weight * stat_loss_prob   # Loss
+    ]
     
-    # Final prediction
-    final_prediction = ['win', 'draw', 'loss'][np.argmax(combined_probs)]
+    # Extra draw penalty
+    draw_penalty = 0.85  # Reduce draw probability by 15%
+    final_probs[1] *= draw_penalty
     
-    return final_prediction, combined_probs, tempered_score
+    # Redistribute draw probability to win/loss
+    redistributed = final_probs[1] * (1 - draw_penalty)
+    final_probs[0] += redistributed * 0.5
+    final_probs[2] += redistributed * 0.5
+    
+    # Renormalize
+    total = sum(final_probs)
+    if total > 0:
+        final_probs = [p / total for p in final_probs]
+    
+    final_prediction = ['W', 'D', 'L'][np.argmax(final_probs)]
+    
+    return final_prediction, final_probs, tempered_score
 
 # -------------------------
 # Enhanced Main Function
 # -------------------------
 if __name__ == '__main__':
-    print("Enhanced ML Voetbalwedstrijdvoorspeller v2.0")
-    print("=" * 55)
+    print("Enhanced XGBoost Voetbalwedstrijdvoorspeller v3.0")
+    print("Met Anti-Draw Bias en Ensemble Learning")
+    print("=" * 60)
     
     print("\nKies een optie:")
-    print("1. Train een nieuw enhanced model")
-    print("2. Voorspelling met enhanced model") 
+    print("1. Train nieuwe modellen (Random Forest + XGBoost)")
+    print("2. Ensemble voorspelling (RF + XGBoost + Statistical)")
     print("3. Traditionele score met enhanced features")
-    print("4. Batch analyse van meerdere wedstrijden")
+    print("4. Model vergelijking en analyse")
+    print("5. Batch analyse van meerdere wedstrijden")
     
-    choice = input("Jouw keuze (1-4): ").strip()
+    choice = input("Jouw keuze (1-5): ").strip()
     
     if choice == "1":
-        print("\nTraining Enhanced Model")
+        print("\nTraining Ensemble Modellen")
         print("Upload CSV-bestanden met uitgebreide historische data")
         
         training_files = []
@@ -1070,14 +1225,14 @@ if __name__ == '__main__':
             
             print(f"  Geladen: {len(df)} wedstrijden")
             
-            # Process each match with sufficient history
-            for i in range(max(5, EMA_SPAN), len(df)):  # Need minimum history
+            # Process each match met voldoende historie
+            for i in range(max(7, EMA_SPAN), len(df)):  # Meer historie nodig
                 try:
                     # Create subsets
                     home_subset = apply_venue_filter(df.iloc[:i+1].copy(), 'home')
                     away_subset = apply_venue_filter(df.iloc[:i+1].copy(), 'away')
                     
-                    if len(home_subset) >= 3 and len(away_subset) >= 3:  # Minimum matches
+                    if len(home_subset) >= 4 and len(away_subset) >= 4:  # Meer minimum matches
                         # Build enhanced features
                         home_feats = build_enhanced_feature_series(home_subset, "HOME")
                         away_feats = build_enhanced_feature_series(away_subset, "AWAY")
@@ -1098,7 +1253,7 @@ if __name__ == '__main__':
         
         print(f"\nTotaal verzamelde samples: {len(X_data)}")
         
-        if len(X_data) < 10:
+        if len(X_data) < 15:
             print("Onvoldoende trainingsdata verzameld.")
             exit()
         
@@ -1108,21 +1263,24 @@ if __name__ == '__main__':
         
         print(f"Feature dimensies: {X_df.shape}")
         print(f"Label distributie:")
-        print(y_series.value_counts())
+        label_counts = y_series.value_counts()
+        print(label_counts)
+        print(f"Draw percentage: {label_counts.get('D', 0) / len(y_series) * 100:.1f}%")
         
-        # Train enhanced model
-        model, scaler = train_enhanced_model(X_df, y_series)
+        # Train ensemble models
+        rf_model, xgb_model, rf_scaler, xgb_scaler, label_encoder = train_dual_models(X_df, y_series)
         
-        if model is not None:
-            print("\nEnhanced model training voltooid!")
+        if rf_model is not None and xgb_model is not None:
+            print("\nEnsemble model training voltooid!")
+            print("Beide Random Forest en XGBoost modellen zijn getraind met anti-draw bias.")
         
     elif choice == "2":
-        print("\nEnhanced Voorspelling")
+        print("\nEnsemble Voorspelling (RF + XGBoost + Statistical)")
         
-        # Load enhanced model
-        model, scaler = load_enhanced_model()
-        if model is None:
-            print("Geen enhanced model gevonden. Train eerst een model.")
+        # Load alle modellen
+        rf_model, xgb_model, rf_scaler, xgb_scaler, label_encoder = load_all_models()
+        if rf_model is None or xgb_model is None:
+            print("Modellen niet gevonden. Train eerst de modellen (optie 1).")
             exit()
         
         # Get team data
@@ -1143,39 +1301,64 @@ if __name__ == '__main__':
         home_feats = build_enhanced_feature_series(home_df, "HOME TEAM")
         away_feats = build_enhanced_feature_series(away_df, "AWAY TEAM")
 
-        # ML prediction
+        # ML ensemble prediction
         features = prepare_enhanced_ml_features(home_feats, away_feats)
-        features_df = pd.DataFrame([features])
-        features_scaled = scaler.transform(features_df)
-        
-        ml_prediction = model.predict(features_scaled)[0]
-        ml_probabilities = model.predict_proba(features_scaled)[0]
+        ensemble_results = ensemble_prediction(
+            rf_model, xgb_model, rf_scaler, xgb_scaler, label_encoder, features
+        )
         
         # Enhanced statistical score
         delta = make_enhanced_delta(home_feats, away_feats)
         final_score, weighted_diff, zt, zo, contribs = compute_enhanced_weighted_score(delta, use_ml_weights=True)
         
-        # Combined prediction
-        final_prediction, combined_probs, tempered_score = enhanced_combined_prediction(
-            ml_prediction, ml_probabilities, final_score)
+        # Ultimate combined prediction
+        final_prediction, final_probs, tempered_score = ultimate_combined_prediction(
+            ensemble_results, final_score
+        )
 
         # Results
-        print(f"\n=== ENHANCED VOORSPELLING ===")
-        print(f"ML Voorspelling: {ml_prediction}")
-        print(f"ML Kansen: Win={ml_probabilities[0]:.3f}, Draw={ml_probabilities[1]:.3f}, Loss={ml_probabilities[2]:.3f}")
-        print(f"Statistische Score (raw): {final_score:.1f}")  
-        print(f"Statistische Score (tempered): {tempered_score:.1f}")
-        print(f"Gecombineerde Kansen: Win={combined_probs[0]:.3f}, Draw={combined_probs[1]:.3f}, Loss={combined_probs[2]:.3f}")
-        print(f"FINALE VOORSPELLING: {final_prediction.upper()}")
+        print(f"\n=== ENSEMBLE VOORSPELLING (Anti-Draw Bias) ===")
+        print(f"\nIndividuele Model Resultaten:")
+        print(f"Random Forest: {ensemble_results['rf_prediction']} - "
+              f"Win={ensemble_results['rf_probabilities'][0]:.3f}, "
+              f"Draw={ensemble_results['rf_probabilities'][1]:.3f}, "
+              f"Loss={ensemble_results['rf_probabilities'][2]:.3f}")
+        
+        print(f"XGBoost:       {ensemble_results['xgb_prediction']} - "
+              f"Win={ensemble_results['xgb_probabilities'][0]:.3f}, "
+              f"Draw={ensemble_results['xgb_probabilities'][1]:.3f}, "
+              f"Loss={ensemble_results['xgb_probabilities'][2]:.3f}")
+        
+        print(f"ML Ensemble:   {ensemble_results['ensemble_prediction']} - "
+              f"Win={ensemble_results['ensemble_probabilities'][0]:.3f}, "
+              f"Draw={ensemble_results['ensemble_probabilities'][1]:.3f}, "
+              f"Loss={ensemble_results['ensemble_probabilities'][2]:.3f}")
+        
+        print(f"\nStatistische Scores:")
+        print(f"Raw Score: {final_score:.1f}")
+        print(f"Anti-Draw Tempered: {tempered_score:.1f}")
+        
+        print(f"\n🏆 FINALE VOORSPELLING: {final_prediction}")
+        print(f"Finale Kansen: Win={final_probs[0]:.3f}, Draw={final_probs[1]:.3f}, Loss={final_probs[2]:.3f}")
+        
+        # Confidence indicator
+        max_prob = max(final_probs)
+        if max_prob > 0.6:
+            confidence = "HOOG"
+        elif max_prob > 0.45:
+            confidence = "GEMIDDELD"
+        else:
+            confidence = "LAAG"
+        print(f"Voorspelling Vertrouwen: {confidence}")
         
         # Top contributing features
-        print(f"\nTop Features (impact):")
+        print(f"\nTop Features (statistisch):")
         sorted_contribs = sorted(contribs.items(), key=lambda x: abs(x[1]), reverse=True)
         for feat, contrib in sorted_contribs[:8]:
             print(f"  {feat}: {contrib:+.3f}")
             
     elif choice == "3":
-        print("\nTraditionele Score met Enhanced Features")
+        print("\nTraditionele Score met Enhanced Features (Anti-Draw Bias)")
         
         home_file = choose_file('Upload THUIS team CSV')
         away_file = choose_file('Upload UIT team CSV')
@@ -1195,20 +1378,38 @@ if __name__ == '__main__':
         delta = make_enhanced_delta(home_feats, away_feats)
         final_score, weighted_diff, zt, zo, contribs = compute_enhanced_weighted_score(delta)
 
-        print(f'\n=== ENHANCED ANALYSE ===')
+        print(f'\n=== ENHANCED ANALYSE (Anti-Draw Bias) ===')
         print(f'Weighted difference = {weighted_diff:.3f}')
         print(f'Final score = {final_score:.1f}')
         
-        if final_score > 52:
-            print("THUIS TEAM voorkeur")
+        if final_score > 55:
+            print("STERKE THUIS TEAM voorkeur")
+        elif final_score > 52:
+            print("THUIS TEAM lichte voorkeur")
+        elif final_score < 45:
+            print("STERKE UIT TEAM voorkeur")
         elif final_score < 48:
-            print("UIT TEAM voorkeur")
+            print("UIT TEAM lichte voorkeur")
         else:
-            print("Teams ongeveer gelijk")
+            print("Teams relatief gelijk (mogelijk spannende wedstrijd)")
     
     elif choice == "4":
-        print("\nBatch Analyse (toekomstige uitbreiding)")
-        print("Deze functie wordt in a volgende versie geïmplementeerd.")
+        print("\nModel Vergelijking en Analyse")
+        
+        # Load models
+        rf_model, xgb_model, rf_scaler, xgb_scaler, label_encoder = load_all_models()
+        if rf_model is None or xgb_model is None:
+            print("Modellen niet gevonden. Train eerst de modellen (optie 1).")
+            exit()
+        
+        print("Model vergelijking functie wordt geïmplementeerd in volgende versie.")
+        print("Deze functie zal model prestaties vergelijken op test data.")
+    
+    elif choice == "5":
+        print("\nBatch Analyse")
+        print("Deze functie wordt geïmplementeerd voor analyse van meerdere wedstrijden tegelijk.")
     
     else:
-        print("Ongeldige keuze. Kies 1, 2, 3 of 4.")
+        print("Ongeldige keuze. Kies 1, 2, 3, 4 of 5.")
+
+print("\nProgramma beëindigd.")
