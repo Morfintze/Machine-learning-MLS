@@ -111,6 +111,18 @@ def choose_file(prompt):
     print(f"{prompt}: {path}")
     return path
 
+def choose_files(prompt):
+    """Selecteer meerdere bestanden tegelijk."""
+    Tk().withdraw()
+    paths = askopenfilename(title=prompt, multiple=True)
+    if paths:
+        print(f"{prompt}: {len(paths)} bestanden geselecteerd")
+        for i, path in enumerate(paths, 1):
+            print(f"  {i}. {path}")
+    else:
+        print("Geen bestanden geselecteerd")
+    return paths
+
 def col_to_str(col):
     if isinstance(col, tuple):
         return " ".join(str(p) for p in col if p is not None).lower()
@@ -1331,7 +1343,7 @@ if __name__ == '__main__':
     print("=" * 60)
     
     print("\nKies een optie:")
-    print("1. Train nieuwe modellen (Random Forest + XGBoost + CNN)")
+    print("1. Train nieuwe modellen (Random Forest + XGBoost + CNN) - meerdere CSV's mogelijk")
     print("2. Ensemble voorspelling (RF + XGBoost + CNN + Statistical)")
     print("3. Traditionele score met enhanced features")
     print("4. Model vergelijking en analyse")
@@ -1343,55 +1355,60 @@ if __name__ == '__main__':
         print("\nTraining Ensemble Modellen")
         print("Upload CSV-bestanden met uitgebreide historische data")
         
-        training_files = []
-        while True:
-            file_path = choose_file('Upload CSV voor training (leeg = stoppen)')
-            if not file_path:
-                break
-            training_files.append(file_path)
+        # Gebruik de nieuwe choose_files functie voor meerdere bestanden
+        training_files = choose_files('Selecteer CSV bestanden voor training (meerdere mogelijk)')
         
         if not training_files:
             print("Geen bestanden geselecteerd.")
             exit()
         
+        # Convert tuple to list if needed (tkinter returns tuple)
+        if isinstance(training_files, tuple):
+            training_files = list(training_files)
+        
         # Collect training data
         X_data = []
         y_data = []
         
-        print("\nVerwerken van trainingsdata...")
-        for file_idx, file_path in enumerate(training_files):
-            print(f"\nBestand {file_idx + 1}/{len(training_files)}: {file_path}")
+        print(f"\nVerwerken van {len(training_files)} trainingsbestanden...")
+        for file_idx, file_path in enumerate(training_files, 1):
+            print(f"\nBestand {file_idx}/{len(training_files)}: {file_path}")
             
-            h_rows = detect_header_rows(file_path)
-            df = pd.read_csv(file_path, header=list(range(h_rows)) if h_rows > 1 else 0, low_memory=False)
-            
-            print(f"  Geladen: {len(df)} wedstrijden")
-            
-            # Process each match met voldoende historie
-            for i in range(max(7, EMA_SPAN), len(df)):  # Meer historie nodig
-                try:
-                    # Create subsets
-                    home_subset = apply_venue_filter(df.iloc[:i+1].copy(), 'home')
-                    away_subset = apply_venue_filter(df.iloc[:i+1].copy(), 'away')
-                    
-                    if len(home_subset) >= 4 and len(away_subset) >= 4:  # Meer minimum matches
-                        # Build enhanced features
-                        home_feats = build_enhanced_feature_series(home_subset, "HOME")
-                        away_feats = build_enhanced_feature_series(away_subset, "AWAY")
+            try:
+                h_rows = detect_header_rows(file_path)
+                df = pd.read_csv(file_path, header=list(range(h_rows)) if h_rows > 1 else 0, low_memory=False)
+                
+                print(f"  Geladen: {len(df)} wedstrijden")
+                
+                # Process each match met voldoende historie
+                for i in range(max(7, EMA_SPAN), len(df)):  # Meer historie nodig
+                    try:
+                        # Create subsets
+                        home_subset = apply_venue_filter(df.iloc[:i+1].copy(), 'home')
+                        away_subset = apply_venue_filter(df.iloc[:i+1].copy(), 'away')
                         
-                        # Prepare ML features
-                        features = prepare_enhanced_ml_features(home_feats, away_feats)
-                        
-                        # Extract result
-                        result = extract_match_result_enhanced(df.iloc[:i+1])
-                        
-                        if result and features:
-                            X_data.append(features)
-                            y_data.append(result)
+                        if len(home_subset) >= 4 and len(away_subset) >= 4:  # Meer minimum matches
+                            # Build enhanced features
+                            home_feats = build_enhanced_feature_series(home_subset, "HOME")
+                            away_feats = build_enhanced_feature_series(away_subset, "AWAY")
                             
-                except Exception as e:
-                    print(f"  Fout bij wedstrijd {i}: {e}")
-                    continue
+                            # Prepare ML features
+                            features = prepare_enhanced_ml_features(home_feats, away_feats)
+                            
+                            # Extract result
+                            result = extract_match_result_enhanced(df.iloc[:i+1])
+                            
+                            if result and features:
+                                X_data.append(features)
+                                y_data.append(result)
+                                
+                    except Exception as e:
+                        print(f"  Fout bij wedstrijd {i}: {e}")
+                        continue
+                        
+            except Exception as e:
+                print(f"  Fout bij laden bestand: {e}")
+                continue
         
         print(f"\nTotaal verzamelde samples: {len(X_data)}")
         
