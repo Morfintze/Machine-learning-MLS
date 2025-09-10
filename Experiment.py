@@ -47,7 +47,7 @@ MIN_STD_VALUES = {
     'Goals': 0.5, 'Prog90': 5.0, 'PrgDist90': 100.0, 'Att3rd90': 10.0,
     'Possession': 0.05, 'FieldTilt': 0.05, 'HighPress': 1.0, 'AerialMismatch': 5.0,
     'KeeperPSxGdiff': 0.2, 'TkldPct_possession': 0.05, 'WonPct_misc': 0.05,
-    'Att_3rd_defense': 1.0, 
+    'Att_3rd_defense': 1.0, 'SetPieces90': 0.8,
     # Nieuwe features
     'WinStreak': 0.5, 'UnbeatenStreak': 0.5, 'LossStreak': 0.5,
     'WinRate5': 0.1, 'WinRate10': 0.1, 'PointsRate5': 0.1, 'PointsRate10': 0.1,
@@ -62,7 +62,7 @@ WEIGHTS = {
     'Goals': 0.8, 'Prog90': 0.35, 'PrgDist90': 0.25, 'Att3rd90': 0.6,
     'FieldTilt': 0.9, 'HighPress': 0.95, 'AerialMismatch': 0.6, 'Possession': 0.4,
     'KeeperPSxGdiff': -0.44, 'GoalsAgainst': -2.481, 'TkldPct_possession': 0.4,
-    'WonPct_misc': 0.4, 'Att_3rd_defense': 0.8,
+    'WonPct_misc': 0.4, 'Att_3rd_defense': 0.8, 'SetPieces90': 0.8,
     # Nieuwe weights - aangepast om gelijkspel te verminderen
     'WinStreak': 1.4, 'UnbeatenStreak': 0.7, 'LossStreak': -1.2,
     'WinRate5': 1.7, 'WinRate10': 1.1, 'PointsRate5': 1.5, 'PointsRate10': 1.0,
@@ -484,7 +484,16 @@ def build_enhanced_feature_series(df, team_name):
     prgdist_col = find_column_flexible(df, [['total_prgdist_passing'], ['prgdist_possession'], ['prgdist'], ['progressive', 'distance'], ['pass', 'prgdist']])
     
     # Set pieces - focus op corners
-    setpieces_col = find_column_flexible(df, [['pass types_ck_passing_types'], ['ck_passing_types'], ['corner', 'kicks'], ['corners'], ['ck']])
+    setpieces_col = find_column_flexible(df, [
+        ['pass types_ck_passing_types'], 
+        ['ck_passing_types'], 
+        ['corner', 'kicks'], 
+        ['corners'], 
+        ['ck'],
+        ['corner_kicks'],
+        ['set_pieces'],
+        ['setpieces']
+    ])
     
     # Attacking third touches
     att3rd_col = find_column_flexible(df, [['touches_att 3rd_possession'], ['touches_att_3rd_possession'], ['att_3rd_possession'], ['att_3rd'], ['att', '3rd']])
@@ -499,6 +508,7 @@ def build_enhanced_feature_series(df, team_name):
     
     # Aerial duels - verbeterde detectie
     aerial_win_col = find_column_flexible(df, [
+        ['wonpct_misc'],  # DIRECTE MATCH met je CSV!
         ['aerial duels_won%_misc'], 
         ['won%_misc'], 
         ['aerial', 'won%'], 
@@ -506,8 +516,23 @@ def build_enhanced_feature_series(df, team_name):
         ['duel', 'won%'],
         ['aerial', 'won', '%'],
         ['aerial', 'success', '%'],
-        ['aerial', 'duels', '%']
+        ['aerial', 'duels', '%'],
+        ['air duels', '%'],
+        ['heading', 'won', '%'],
+        ['header', 'won', '%']
     ])
+
+    # Debug voor aerial win
+    if aerial_win_col:
+        print(f"Aerial win kolom gevonden: {aerial_win_col}")
+        print(f"Eerste paar waarden: {df[aerial_win_col].head().tolist()}")
+    else:
+        print("AERIAL WIN KOLOM NIET GEVONDEN!")
+        print("Beschikbare kolommen met 'won' of 'aerial':")
+        for col in df.columns:
+            col_lower = str(col).lower()
+            if 'won' in col_lower or 'aerial' in col_lower or 'duel' in col_lower:
+                print(f"  Mogelijke kandidaat: {col}")
     
     # Defensive actions
     def3rd_col = find_column_flexible(df, [['tackles_def 3rd_defense'], ['def_3rd_defense'], ['defensive', '3rd']])
@@ -521,6 +546,18 @@ def build_enhanced_feature_series(df, team_name):
     
     # Attacking third defense
     att3rddef_col = find_column_flexible(df, [['tackles_att 3rd_defense'], ['att_3rd_defense'], ['attacking', '3rd', 'tackles']])
+    
+    # Debug voor set pieces
+    if setpieces_col:
+        print(f"Set pieces (corners) kolom gevonden: {setpieces_col}")
+        print(f"Eerste paar waarden: {df[setpieces_col].head().tolist()}")
+    else:
+        print("SET PIECES KOLOM NIET GEVONDEN!")
+        print("Beschikbare kolommen met 'ck' of 'corner':")
+        for col in df.columns:
+            col_lower = str(col).lower()
+            if 'ck' in col_lower or 'corner' in col_lower:
+                print(f"  Mogelijke kandidaat: {col}")
     
     # Basic features (per 90 minutes)
     def per90(col):
