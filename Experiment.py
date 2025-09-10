@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-enhanced_ml_soccer_predictor_xgboost.py
-Uitgebreide versie met XGBoost model voor betere voorspellingen en minder gelijkspel-bias
+enhanced_ml_soccer_predictor_cnn.py
+Uitgebreide versie met CNN model integratie
 """
 
 import pandas as pd
@@ -20,14 +20,23 @@ import xgboost as xgb
 from scipy.stats import mode
 import seaborn as sns
 import matplotlib.pyplot as plt
+import tensorflow as tf
+from tensorflow.keras.models import Sequential, Model
+from tensorflow.keras.layers import Dense, Dropout, Conv1D, MaxPooling1D, Flatten, Input, Concatenate
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.utils import to_categorical
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  # Disable GPU
 
 # -------------------------
-# Enhanced Config with XGBoost
+# Enhanced Config with CNN
 # -------------------------
 EMA_SPAN = 7
 SCALE_TO_SCORE = 4.0
 MODEL_FILE = "enhanced_soccer_model.pkl"
 XGBOOST_MODEL_FILE = "enhanced_xgboost_model.pkl"
+CNN_MODEL_FILE = "enhanced_cnn_model.h5"
 SCALER_FILE = "enhanced_scaler.pkl"
 WEIGHTS_FILE = "enhanced_dynamic_weights.pkl"
 LABEL_ENCODER_FILE = "label_encoder.pkl"
@@ -38,13 +47,12 @@ MIN_STD_VALUES = {
     'Goals': 0.5, 'Prog90': 5.0, 'PrgDist90': 100.0, 'Att3rd90': 10.0,
     'Possession': 0.05, 'FieldTilt': 0.05, 'HighPress': 1.0, 'AerialMismatch': 5.0,
     'KeeperPSxGdiff': 0.2, 'TkldPct_possession': 0.05, 'WonPct_misc': 0.05,
-    'Att_3rd_defense': 1.0, 'SavePct_keeper': 0.05,
+    'Att_3rd_defense': 1.0, 
     # Nieuwe features
     'WinStreak': 0.5, 'UnbeatenStreak': 0.5, 'LossStreak': 0.5,
     'WinRate5': 0.1, 'WinRate10': 0.1, 'PointsRate5': 0.1, 'PointsRate10': 0.1,
-    'RestDays': 1.0, 'RecentForm': 0.2, 'GoalDifference': 0.5,
-    'CleanSheetRate': 0.05, 'ScoringRate': 0.05, 'AvgGoalsFor': 0.2,
-    'HomeAdvantage': 0.1, 'SeasonProgress': 0.1
+    'RestDays': 1.0, 'RecentForm': 0.2,
+    'HomeAdvantage': 0.1
 }
 
 # Uitgebreide initiele gewichten - aangepast voor gelijkspel-bias
@@ -52,15 +60,14 @@ WEIGHTS = {
     # Bestaande weights met aanpassingen
     'xG90': 1.1, 'Sh90': 1.6, 'SoT90': 0.8, 'ShotQual': 1.5, 'ConvRatio90': 1.8,
     'Goals': 0.8, 'Prog90': 0.35, 'PrgDist90': 0.25, 'Att3rd90': 0.6,
-    'FieldTilt': 0.9, 'HighPress': 0.95, 'AerialMismatch': 0.6, 'Possession': 0.4,  # Verhoogd
+    'FieldTilt': 0.9, 'HighPress': 0.95, 'AerialMismatch': 0.6, 'Possession': 0.4,
     'KeeperPSxGdiff': -0.44, 'GoalsAgainst': -2.481, 'TkldPct_possession': 0.4,
-    'WonPct_misc': 0.4, 'Att_3rd_defense': 0.8, 'SavePct_keeper': 0.3,  # Verhoogd
+    'WonPct_misc': 0.4, 'Att_3rd_defense': 0.8,
     # Nieuwe weights - aangepast om gelijkspel te verminderen
-    'WinStreak': 1.4, 'UnbeatenStreak': 0.7, 'LossStreak': -1.2,  # Meer extreme waardering
-    'WinRate5': 1.7, 'WinRate10': 1.1, 'PointsRate5': 1.5, 'PointsRate10': 1.0,  # Verhoogd
-    'RestDays': 0.4, 'RecentForm': 1.3, 'GoalDifference': 1.1,  # Verhoogd
-    'CleanSheetRate': 0.8, 'ScoringRate': 0.9, 'AvgGoalsFor': 1.2,  # Verhoogd
-    'HomeAdvantage': 0.6, 'SeasonProgress': 0.2
+    'WinStreak': 1.4, 'UnbeatenStreak': 0.7, 'LossStreak': -1.2,
+    'WinRate5': 1.7, 'WinRate10': 1.1, 'PointsRate5': 1.5, 'PointsRate10': 1.0,
+    'RestDays': 0.4, 'RecentForm': 1.3,
+    'HomeAdvantage': 0.6
 }
 
 ML_WEIGHTS = WEIGHTS.copy()
@@ -79,11 +86,24 @@ XGBOOST_PARAMS = {
     'random_state': 42,
     'reg_alpha': 0.1,
     'reg_lambda': 0.1,
-    'scale_pos_weight': 1.2  # Helpt bij class imbalance
+    'scale_pos_weight': 1.2
+}
+
+# CNN parameters
+CNN_PARAMS = {
+    'filters': [64, 128, 64],
+    'kernel_size': 3,
+    'pool_size': 2,
+    'dense_units': [128, 64],
+    'dropout_rate': 0.3,
+    'learning_rate': 0.001,
+    'epochs': 100,
+    'batch_size': 32,
+    'patience': 15
 }
 
 # -------------------------
-# Enhanced Helper Functions (same as before)
+# Enhanced Helper Functions
 # -------------------------
 def choose_file(prompt):
     Tk().withdraw()
@@ -200,7 +220,7 @@ def extract_match_result_from_string(result_str, goals_for=None):
     return None
 
 # -------------------------
-# Enhanced Feature Engineering (same as before)
+# Enhanced Feature Engineering
 # -------------------------
 def calculate_historical_features(df):
     """Berekent historische prestatie-features."""
@@ -212,8 +232,7 @@ def calculate_historical_features(df):
         default_features = {
             'WinStreak': 0, 'UnbeatenStreak': 0, 'LossStreak': 0,
             'WinRate5': 0, 'WinRate10': 0, 'PointsRate5': 0, 'PointsRate10': 0,
-            'RestDays': 7, 'RecentForm': 0, 'GoalDifference': 0,
-            'CleanSheetRate': 0, 'ScoringRate': 0, 'AvgGoalsFor': 0
+            'RestDays': 7, 'RecentForm': 0
         }
         return {k: pd.Series([v]) for k, v in default_features.items()}
     
@@ -256,10 +275,6 @@ def calculate_historical_features(df):
     points_rates_5 = []
     points_rates_10 = []
     recent_forms = []
-    goal_diffs = []
-    clean_sheet_rates = []
-    scoring_rates = []
-    avg_goals_for = []
     rest_days = []
     
     for i in range(n):
@@ -326,23 +341,6 @@ def calculate_historical_features(df):
                     form_score += 1 * weights[j]
         recent_forms.append(form_score)
         
-        # Goal difference (only for the last 7 matches, not cumulative)
-        start_idx = max(0, i - 6)  # Last 7 matches including current
-        gf_sum = sum(goals_for[start_idx:i+1])
-        ga_sum = sum(goals_against[start_idx:i+1])
-        goal_diffs.append(gf_sum - ga_sum)
-        
-        # Clean sheet rate (only for the last 7 matches)
-        clean_sheets = sum(1 for j in range(start_idx, i+1) if goals_against[j] == 0)
-        clean_sheet_rates.append(clean_sheets / max(1, i+1 - start_idx))
-        
-        # Scoring rate (games with goals, only for the last 7 matches)
-        scoring_games = sum(1 for j in range(start_idx, i+1) if goals_for[j] > 0)
-        scoring_rates.append(scoring_games / max(1, i+1 - start_idx))
-        
-        # Average goals for (only for the last 7 matches)
-        avg_goals_for.append(sum(goals_for[start_idx:i+1]) / max(1, i+1 - start_idx))
-        
         # Rest days
         if date_col and i > 0:
             current_date = df['parsed_date'].iloc[i]
@@ -364,10 +362,6 @@ def calculate_historical_features(df):
     features['PointsRate10'] = pd.Series(points_rates_10)
     features['RestDays'] = pd.Series(rest_days)
     features['RecentForm'] = pd.Series(recent_forms)
-    features['GoalDifference'] = pd.Series(goal_diffs)
-    features['CleanSheetRate'] = pd.Series(clean_sheet_rates)
-    features['ScoringRate'] = pd.Series(scoring_rates)
-    features['AvgGoalsFor'] = pd.Series(avg_goals_for)
     
     return features
 
@@ -378,13 +372,8 @@ def calculate_seasonal_context_features(df):
     
     if n == 0:
         return {
-            'SeasonProgress': pd.Series([0.0]),
             'HomeAdvantage': pd.Series([0.0])
         }
-    
-    # Season progress (assumes ~34 game season)
-    season_progress = [(i + 1) / 34.0 for i in range(n)]
-    features['SeasonProgress'] = pd.Series(season_progress)
     
     # Home advantage (recent home performance vs away)
     venue_col = find_column(df, ['venue'])
@@ -521,9 +510,6 @@ def build_enhanced_feature_series(df, team_name):
     # Attacking third defense
     att3rddef_col = find_column_flexible(df, [['tackles_att 3rd_defense'], ['att_3rd_defense'], ['attacking', '3rd', 'tackles']])
     
-    # Save percentage - verbeterde detectie
-    savepct_col = find_column_flexible(df, [['save%_keeper'], ['savepct_keeper'], ['save', '%'], ['performance_save%_keeper']])
-
     # Basic features (per 90 minutes)
     def per90(col):
         return series_to_numeric(df[col]) / minutes * 90.0 if col else pd.Series([0.0] * n)
@@ -629,12 +615,6 @@ def build_enhanced_feature_series(df, team_name):
 
     feats['Att_3rd_defense'] = per90(att3rddef_col) if att3rddef_col else pd.Series([0.0] * n)
 
-    if savepct_col:
-        save_raw = series_to_numeric(df[savepct_col])
-        feats['SavePct_keeper'] = save_raw / 100.0 if save_raw.max() > 1.5 else save_raw
-    else:
-        feats['SavePct_keeper'] = pd.Series([0.0] * n)
-
     # Add historical performance features
     historical_feats = calculate_historical_features(df)
     feats.update(historical_feats)
@@ -646,7 +626,7 @@ def build_enhanced_feature_series(df, team_name):
     return feats
 
 # -------------------------
-# Enhanced EMA and Delta Functions (mostly same as before)
+# Enhanced EMA and Delta Functions
 # -------------------------
 def ema(series, span=EMA_SPAN):
     """Enhanced EMA with better handling of edge cases."""
@@ -664,12 +644,11 @@ def make_enhanced_delta(team_feats, opp_feats):
     keys = [
         'xG90', 'Sh90', 'SoT90', 'ShotQual', 'ConvRatio90', 'Goals', 'GoalsAgainst',
         'Prog90', 'PrgDist90', 'SetPieces90', 'Att3rd90', 'Possession',
-        'TkldPct_possession', 'WonPct_misc', 'Att_3rd_defense', 'SavePct_keeper',
+        'TkldPct_possession', 'WonPct_misc', 'Att_3rd_defense',
         # New historical features
         'WinStreak', 'UnbeatenStreak', 'LossStreak', 'WinRate5', 'WinRate10', 
-        'PointsRate5', 'PointsRate10', 'RestDays', 'RecentForm', 'GoalDifference',
-        'CleanSheetRate', 'ScoringRate', 'AvgGoalsFor',
-        'SeasonProgress', 'HomeAdvantage'
+        'PointsRate5', 'PointsRate10', 'RestDays', 'RecentForm',
+        'HomeAdvantage'
     ]
     
     for k in keys:
@@ -739,9 +718,9 @@ def compute_enhanced_weighted_score(delta_dict, use_ml_weights=False):
         # Anti-draw scaling factors
         if feat in ['WinRate5', 'WinRate10', 'PointsRate5', 'PointsRate10', 'RecentForm']:
             scaling_factor = 1.4  # Verhoogd van 1.2
-        elif feat in ['WinStreak', 'LossStreak', 'GoalDifference']:
+        elif feat in ['WinStreak', 'LossStreak']:
             scaling_factor = 1.3  # Nieuwe categorie voor extremere features
-        elif feat in ['RestDays', 'SeasonProgress']:
+        elif feat in ['RestDays']:
             scaling_factor = 0.8
         else:
             scaling_factor = 1.1  # Verhoogd van 1.0
@@ -776,7 +755,153 @@ def compute_enhanced_weighted_score(delta_dict, use_ml_weights=False):
     return final, scaled_diff, z_team, z_opp, contribs
 
 # -------------------------
-# NEW: XGBoost Functions
+# NEW: CNN Functions
+# -------------------------
+def create_cnn_model(input_shape, num_classes=3):
+    """Creëer een 1D CNN model voor tabulaire data."""
+    model = Sequential()
+    
+    # Eerste convolutie layer
+    model.add(Conv1D(filters=CNN_PARAMS['filters'][0], 
+                     kernel_size=CNN_PARAMS['kernel_size'], 
+                     activation='relu', 
+                     input_shape=input_shape))
+    model.add(MaxPooling1D(pool_size=CNN_PARAMS['pool_size']))
+    model.add(Dropout(CNN_PARAMS['dropout_rate']))
+    
+    # Tweede convolutie layer
+    model.add(Conv1D(filters=CNN_PARAMS['filters'][1], 
+                     kernel_size=CNN_PARAMS['kernel_size'], 
+                     activation='relu'))
+    model.add(MaxPooling1D(pool_size=CNN_PARAMS['pool_size']))
+    model.add(Dropout(CNN_PARAMS['dropout_rate']))
+    
+    # Derde convolutie layer
+    model.add(Conv1D(filters=CNN_PARAMS['filters'][2], 
+                     kernel_size=CNN_PARAMS['kernel_size'], 
+                     activation='relu'))
+    model.add(MaxPooling1D(pool_size=CNN_PARAMS['pool_size']))
+    model.add(Dropout(CNN_PARAMS['dropout_rate']))
+    
+    # Flatten en dense layers
+    model.add(Flatten())
+    model.add(Dense(CNN_PARAMS['dense_units'][0], activation='relu'))
+    model.add(Dropout(CNN_PARAMS['dropout_rate']))
+    model.add(Dense(CNN_PARAMS['dense_units'][1], activation='relu'))
+    model.add(Dropout(CNN_PARAMS['dropout_rate']))
+    
+    # Output layer
+    model.add(Dense(num_classes, activation='softmax'))
+    
+    # Compile model
+    model.compile(optimizer=Adam(learning_rate=CNN_PARAMS['learning_rate']),
+                  loss='categorical_crossentropy',
+                  metrics=['accuracy'])
+    
+    return model
+
+def train_cnn_model(X, y):
+    """Train een CNN model met anti-draw bias."""
+    if len(X) < 10:
+        print(f"Onvoldoende data voor CNN training: {len(X)} samples. Minimum 10 vereist.")
+        return None, None, None
+    
+    # Label encoding
+    le = LabelEncoder()
+    y_encoded = le.fit_transform(y)
+    y_categorical = to_categorical(y_encoded)
+    
+    # Split the data
+    test_size = min(0.3, max(0.1, len(X) * 0.2 / len(X)))
+    X_train, X_test, y_train, y_test = train_test_split(X, y_categorical, test_size=test_size, 
+                                                        random_state=42, stratify=y_encoded)
+    
+    # Scale features
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+    
+    # Reshape for CNN (samples, timesteps, features)
+    X_train_reshaped = X_train_scaled.reshape(X_train_scaled.shape[0], X_train_scaled.shape[1], 1)
+    X_test_reshaped = X_test_scaled.reshape(X_test_scaled.shape[0], X_test_scaled.shape[1], 1)
+    
+    # Create and train CNN model
+    model = create_cnn_model((X_train_reshaped.shape[1], 1), num_classes=3)
+    
+    # Early stopping
+    early_stop = EarlyStopping(monitor='val_loss', patience=CNN_PARAMS['patience'], restore_best_weights=True)
+    
+    # Train model
+    history = model.fit(
+        X_train_reshaped, y_train,
+        epochs=CNN_PARAMS['epochs'],
+        batch_size=CNN_PARAMS['batch_size'],
+        validation_data=(X_test_reshaped, y_test),
+        callbacks=[early_stop],
+        verbose=1
+    )
+    
+    # Evaluate model
+    test_loss, test_acc = model.evaluate(X_test_reshaped, y_test, verbose=0)
+    print(f"\nCNN Model Performance:")
+    print(f"Nauwkeurigheid: {test_acc:.3f}")
+    print(f"Training samples: {len(X_train)}, Test samples: {len(X_test)}")
+    
+    # Predictions
+    y_pred_proba = model.predict(X_test_reshaped)
+    y_pred = np.argmax(y_pred_proba, axis=1)
+    
+    # Convert back to original labels for report
+    y_test_original = le.inverse_transform(np.argmax(y_test, axis=1))
+    y_pred_original = le.inverse_transform(y_pred)
+    
+    print("\nCNN Classificatie Rapport:")
+    print(classification_report(y_test_original, y_pred_original))
+    
+    # Confusion Matrix
+    cm = confusion_matrix(y_test_original, y_pred_original, labels=['W', 'D', 'L'])
+    print(f"\nConfusion Matrix:")
+    print(f"{'':>8} {'W':>8} {'D':>8} {'L':>8}")
+    for i, true_label in enumerate(['W', 'D', 'L']):
+        print(f"{true_label:>8} {cm[i][0]:>8} {cm[i][1]:>8} {cm[i][2]:>8}")
+    
+    # Cross-validation score
+    cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+    cv_scores = []
+    
+    for train_idx, val_idx in cv.split(X, y_encoded):
+        X_train_cv, X_val_cv = X.iloc[train_idx], X.iloc[val_idx]
+        y_train_cv, y_val_cv = y_encoded[train_idx], y_encoded[val_idx]
+        
+        # Scale
+        scaler_cv = StandardScaler()
+        X_train_cv_scaled = scaler_cv.fit_transform(X_train_cv)
+        X_val_cv_scaled = scaler_cv.transform(X_val_cv)
+        
+        # Reshape
+        X_train_cv_reshaped = X_train_cv_scaled.reshape(X_train_cv_scaled.shape[0], X_train_cv_scaled.shape[1], 1)
+        X_val_cv_reshaped = X_val_cv_scaled.reshape(X_val_cv_scaled.shape[0], X_val_cv_scaled.shape[1], 1)
+        
+        # Convert to categorical
+        y_train_cv_cat = to_categorical(y_train_cv)
+        y_val_cv_cat = to_categorical(y_val_cv)
+        
+        # Create and train model
+        model_cv = create_cnn_model((X_train_cv_reshaped.shape[1], 1), num_classes=3)
+        model_cv.fit(X_train_cv_reshaped, y_train_cv_cat, epochs=CNN_PARAMS['epochs'], 
+                    batch_size=CNN_PARAMS['batch_size'], verbose=0)
+        
+        # Evaluate
+        _, acc = model_cv.evaluate(X_val_cv_reshaped, y_val_cv_cat, verbose=0)
+        cv_scores.append(acc)
+    
+    print(f"\nCross-validation scores: {cv_scores}")
+    print(f"CV Mean: {np.mean(cv_scores):.3f} (+/- {np.std(cv_scores) * 2:.3f})")
+    
+    return model, scaler, le
+
+# -------------------------
+# Ensemble Functions
 # -------------------------
 def create_draw_penalty_weights(y):
     """Creëer aangepaste class weights om gelijkspel-bias te verminderen."""
@@ -884,8 +1009,8 @@ def train_xgboost_model(X, y):
     
     return xgb_model, scaler, le
 
-def ensemble_prediction(rf_model, xgb_model, rf_scaler, xgb_scaler, label_encoder, features):
-    """Combineer Random Forest en XGBoost voorspellingen."""
+def ensemble_prediction(rf_model, xgb_model, cnn_model, rf_scaler, xgb_scaler, cnn_scaler, label_encoder, features):
+    """Combineer Random Forest, XGBoost en CNN voorspellingen."""
     features_df = pd.DataFrame([features])
     
     # Random Forest prediction
@@ -899,19 +1024,31 @@ def ensemble_prediction(rf_model, xgb_model, rf_scaler, xgb_scaler, label_encode
     xgb_prediction = label_encoder.inverse_transform([xgb_prediction_encoded])[0]
     xgb_probabilities = xgb_model.predict_proba(xgb_features_scaled)[0]
     
-    # Convert XGB probabilities to same order as RF (W, D, L)
+    # CNN prediction
+    cnn_features_scaled = cnn_scaler.transform(features_df)
+    cnn_features_reshaped = cnn_features_scaled.reshape(cnn_features_scaled.shape[0], cnn_features_scaled.shape[1], 1)
+    cnn_probabilities = cnn_model.predict(cnn_features_reshaped)[0]
+    cnn_prediction_encoded = np.argmax(cnn_probabilities)
+    cnn_prediction = label_encoder.inverse_transform([cnn_prediction_encoded])[0]
+    
+    # Convert XGB and CNN probabilities to same order as RF (W, D, L)
     xgb_classes = label_encoder.inverse_transform(range(len(label_encoder.classes_)))
     xgb_prob_dict = dict(zip(xgb_classes, xgb_probabilities))
     xgb_probs_ordered = [xgb_prob_dict.get(cls, 0) for cls in ['W', 'D', 'L']]
     
-    # Ensemble weighting - meer gewicht naar XGBoost vanwege anti-draw bias
-    rf_weight = 0.4
-    xgb_weight = 0.6
+    cnn_classes = label_encoder.inverse_transform(range(len(label_encoder.classes_)))
+    cnn_prob_dict = dict(zip(cnn_classes, cnn_probabilities))
+    cnn_probs_ordered = [cnn_prob_dict.get(cls, 0) for cls in ['W', 'D', 'L']]
+    
+    # Ensemble weighting - meer gewicht naar CNN en XGBoost vanwege anti-draw bias
+    rf_weight = 0.3
+    xgb_weight = 0.35
+    cnn_weight = 0.35
     
     ensemble_probs = [
-        rf_weight * rf_probabilities[0] + xgb_weight * xgb_probs_ordered[0],  # Win
-        rf_weight * rf_probabilities[1] + xgb_weight * xgb_probs_ordered[1],  # Draw
-        rf_weight * rf_probabilities[2] + xgb_weight * xgb_probs_ordered[2]   # Loss
+        rf_weight * rf_probabilities[0] + xgb_weight * xgb_probs_ordered[0] + cnn_weight * cnn_probs_ordered[0],  # Win
+        rf_weight * rf_probabilities[1] + xgb_weight * xgb_probs_ordered[1] + cnn_weight * cnn_probs_ordered[1],  # Draw
+        rf_weight * rf_probabilities[2] + xgb_weight * xgb_probs_ordered[2] + cnn_weight * cnn_probs_ordered[2]   # Loss
     ]
     
     ensemble_prediction = ['W', 'D', 'L'][np.argmax(ensemble_probs)]
@@ -921,12 +1058,14 @@ def ensemble_prediction(rf_model, xgb_model, rf_scaler, xgb_scaler, label_encode
         'rf_probabilities': rf_probabilities,
         'xgb_prediction': xgb_prediction,
         'xgb_probabilities': xgb_probs_ordered,
+        'cnn_prediction': cnn_prediction,
+        'cnn_probabilities': cnn_probs_ordered,
         'ensemble_prediction': ensemble_prediction,
         'ensemble_probabilities': ensemble_probs
     }
 
 # -------------------------
-# Enhanced ML Functions (updated for XGBoost)
+# Enhanced ML Functions
 # -------------------------
 def extract_match_result_enhanced(df):
     """Enhanced result extraction with better error handling."""
@@ -975,11 +1114,9 @@ def prepare_enhanced_ml_features(home_feats, away_feats):
     # Add interaction features voor sleutel metrics
     key_interactions = [
         ('WinRate5', 'RecentForm'),
-        ('GoalDifference', 'AvgGoalsFor'),
-        ('CleanSheetRate', 'SavePct_keeper'),
         ('RestDays', 'WinStreak'),
-        ('xG90', 'ShotQual'),  # Nieuwe interactie
-        ('Possession', 'FieldTilt')  # Nieuwe interactie
+        ('xG90', 'ShotQual'),
+        ('Possession', 'FieldTilt')
     ]
     
     for feat1, feat2 in key_interactions:
@@ -991,11 +1128,11 @@ def prepare_enhanced_ml_features(home_feats, away_feats):
     
     return combined_features
 
-def train_dual_models(X, y):
-    """Train zowel Random Forest als XGBoost modellen."""
+def train_triple_models(X, y):
+    """Train Random Forest, XGBoost en CNN modellen."""
     if len(X) < 10:
         print(f"Onvoldoende data voor training: {len(X)} samples. Minimum 10 vereist.")
-        return None, None, None, None, None
+        return None, None, None, None, None, None, None
     
     print("Training Random Forest model...")
     rf_model, rf_scaler = train_enhanced_rf_model(X, y)
@@ -1003,7 +1140,10 @@ def train_dual_models(X, y):
     print("\nTraining XGBoost model...")
     xgb_model, xgb_scaler, label_encoder = train_xgboost_model(X, y)
     
-    if rf_model is not None and xgb_model is not None:
+    print("\nTraining CNN model...")
+    cnn_model, cnn_scaler, _ = train_cnn_model(X, y)
+    
+    if rf_model is not None and xgb_model is not None and cnn_model is not None:
         # Save alle modellen
         with open(MODEL_FILE, 'wb') as f:
             pickle.dump(rf_model, f)
@@ -1011,8 +1151,10 @@ def train_dual_models(X, y):
         with open(XGBOOST_MODEL_FILE, 'wb') as f:
             pickle.dump(xgb_model, f)
         
+        cnn_model.save(CNN_MODEL_FILE)
+        
         with open(SCALER_FILE, 'wb') as f:
-            pickle.dump({'rf_scaler': rf_scaler, 'xgb_scaler': xgb_scaler}, f)
+            pickle.dump({'rf_scaler': rf_scaler, 'xgb_scaler': xgb_scaler, 'cnn_scaler': cnn_scaler}, f)
             
         with open(LABEL_ENCODER_FILE, 'wb') as f:
             pickle.dump(label_encoder, f)
@@ -1020,10 +1162,11 @@ def train_dual_models(X, y):
         print(f"\nAlle modellen opgeslagen!")
         print(f"Random Forest: {MODEL_FILE}")
         print(f"XGBoost: {XGBOOST_MODEL_FILE}")
+        print(f"CNN: {CNN_MODEL_FILE}")
         print(f"Scalers: {SCALER_FILE}")
         print(f"Label Encoder: {LABEL_ENCODER_FILE}")
     
-    return rf_model, xgb_model, rf_scaler, xgb_scaler, label_encoder
+    return rf_model, xgb_model, cnn_model, rf_scaler, xgb_scaler, cnn_scaler, label_encoder
 
 def train_enhanced_rf_model(X, y):
     """Train Random Forest met aangepaste parameters."""
@@ -1040,12 +1183,12 @@ def train_enhanced_rf_model(X, y):
     
     # Enhanced Random Forest
     model = RandomForestClassifier(
-        n_estimators=250,  # Meer bomen
-        max_depth=18,      # Dieper voor meer complexiteit
+        n_estimators=250,
+        max_depth=18,
         min_samples_split=4,
         min_samples_leaf=2,
         random_state=42,
-        class_weight=class_weights,  # Custom weights
+        class_weight=class_weights,
         max_features='sqrt'
     )
     
@@ -1071,24 +1214,23 @@ def load_all_models():
         with open(XGBOOST_MODEL_FILE, 'rb') as f:
             xgb_model = pickle.load(f)
             
+        cnn_model = tf.keras.models.load_model(CNN_MODEL_FILE)
+            
         with open(SCALER_FILE, 'rb') as f:
             scalers = pickle.load(f)
-            if isinstance(scalers, dict):
-                rf_scaler = scalers['rf_scaler']
-                xgb_scaler = scalers['xgb_scaler']
-            else:
-                # Backward compatibility
-                rf_scaler = xgb_scaler = scalers
+            rf_scaler = scalers['rf_scaler']
+            xgb_scaler = scalers['xgb_scaler']
+            cnn_scaler = scalers['cnn_scaler']
         
         with open(LABEL_ENCODER_FILE, 'rb') as f:
             label_encoder = pickle.load(f)
         
         print("Alle modellen succesvol geladen!")
-        return rf_model, xgb_model, rf_scaler, xgb_scaler, label_encoder
+        return rf_model, xgb_model, cnn_model, rf_scaler, xgb_scaler, cnn_scaler, label_encoder
         
     except FileNotFoundError as e:
         print(f"Model niet gevonden: {e}")
-        return None, None, None, None, None
+        return None, None, None, None, None, None, None
 
 def ultimate_combined_prediction(ensemble_results, statistical_score):
     """
@@ -1184,13 +1326,13 @@ def ultimate_combined_prediction(ensemble_results, statistical_score):
 # Enhanced Main Function
 # -------------------------
 if __name__ == '__main__':
-    print("Enhanced XGBoost Voetbalwedstrijdvoorspeller v3.0")
-    print("Met Anti-Draw Bias en Ensemble Learning")
+    print("Enhanced CNN Voetbalwedstrijdvoorspeller v4.0")
+    print("Met Anti-Draw Bias en Ensemble Learning (RF + XGBoost + CNN)")
     print("=" * 60)
     
     print("\nKies een optie:")
-    print("1. Train nieuwe modellen (Random Forest + XGBoost)")
-    print("2. Ensemble voorspelling (RF + XGBoost + Statistical)")
+    print("1. Train nieuwe modellen (Random Forest + XGBoost + CNN)")
+    print("2. Ensemble voorspelling (RF + XGBoost + CNN + Statistical)")
     print("3. Traditionele score met enhanced features")
     print("4. Model vergelijking en analyse")
     print("5. Batch analyse van meerdere wedstrijden")
@@ -1268,18 +1410,18 @@ if __name__ == '__main__':
         print(f"Draw percentage: {label_counts.get('D', 0) / len(y_series) * 100:.1f}%")
         
         # Train ensemble models
-        rf_model, xgb_model, rf_scaler, xgb_scaler, label_encoder = train_dual_models(X_df, y_series)
+        rf_model, xgb_model, cnn_model, rf_scaler, xgb_scaler, cnn_scaler, label_encoder = train_triple_models(X_df, y_series)
         
-        if rf_model is not None and xgb_model is not None:
+        if rf_model is not None and xgb_model is not None and cnn_model is not None:
             print("\nEnsemble model training voltooid!")
-            print("Beide Random Forest en XGBoost modellen zijn getraind met anti-draw bias.")
+            print("Random Forest, XGBoost en CNN modellen zijn getraind met anti-draw bias.")
         
     elif choice == "2":
-        print("\nEnsemble Voorspelling (RF + XGBoost + Statistical)")
+        print("\nEnsemble Voorspelling (RF + XGBoost + CNN + Statistical)")
         
         # Load alle modellen
-        rf_model, xgb_model, rf_scaler, xgb_scaler, label_encoder = load_all_models()
-        if rf_model is None or xgb_model is None:
+        rf_model, xgb_model, cnn_model, rf_scaler, xgb_scaler, cnn_scaler, label_encoder = load_all_models()
+        if rf_model is None or xgb_model is None or cnn_model is None:
             print("Modellen niet gevonden. Train eerst de modellen (optie 1).")
             exit()
         
@@ -1304,7 +1446,7 @@ if __name__ == '__main__':
         # ML ensemble prediction
         features = prepare_enhanced_ml_features(home_feats, away_feats)
         ensemble_results = ensemble_prediction(
-            rf_model, xgb_model, rf_scaler, xgb_scaler, label_encoder, features
+            rf_model, xgb_model, cnn_model, rf_scaler, xgb_scaler, cnn_scaler, label_encoder, features
         )
         
         # Enhanced statistical score
@@ -1328,6 +1470,11 @@ if __name__ == '__main__':
               f"Win={ensemble_results['xgb_probabilities'][0]:.3f}, "
               f"Draw={ensemble_results['xgb_probabilities'][1]:.3f}, "
               f"Loss={ensemble_results['xgb_probabilities'][2]:.3f}")
+        
+        print(f"CNN:           {ensemble_results['cnn_prediction']} - "
+              f"Win={ensemble_results['cnn_probabilities'][0]:.3f}, "
+              f"Draw={ensemble_results['cnn_probabilities'][1]:.3f}, "
+              f"Loss={ensemble_results['cnn_probabilities'][2]:.3f}")
         
         print(f"ML Ensemble:   {ensemble_results['ensemble_prediction']} - "
               f"Win={ensemble_results['ensemble_probabilities'][0]:.3f}, "
@@ -1397,8 +1544,8 @@ if __name__ == '__main__':
         print("\nModel Vergelijking en Analyse")
         
         # Load models
-        rf_model, xgb_model, rf_scaler, xgb_scaler, label_encoder = load_all_models()
-        if rf_model is None or xgb_model is None:
+        rf_model, xgb_model, cnn_model, rf_scaler, xgb_scaler, cnn_scaler, label_encoder = load_all_models()
+        if rf_model is None or xgb_model is None or cnn_model is None:
             print("Modellen niet gevonden. Train eerst de modellen (optie 1).")
             exit()
         
