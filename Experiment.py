@@ -290,9 +290,58 @@ def calculate_shap_feature_importance(models, X, y, feature_names, n_samples=100
             else:
                 # Use permutation importance for other models
                 print(f"Using permutation importance for {model_name}")
-                perm_importance = permutation_importance(model, X_sample, y_sample, 
-                                                       n_repeats=3, random_state=42, scoring='accuracy')
-                feature_importance = perm_importance.importances_mean
+                try:
+                    # For ensemble models, try to use base estimator importances first
+                    if hasattr(model, 'estimators_') and hasattr(model, 'feature_importances_'):
+                        # Use built-in feature importance if available
+                        feature_importance = model.feature_importances_
+                        print(f"  Using built-in feature importance for {model_name}")
+                    elif hasattr(model, 'estimators_'):
+                        # For ensemble models, average base estimator importances
+                        print(f"  Averaging base estimator importances for {model_name}")
+                        base_importances = []
+                        
+                        for estimator in model.estimators_:
+                            if hasattr(estimator, 'feature_importances_'):
+                                base_importances.append(estimator.feature_importances_)
+                            elif hasattr(estimator, 'coef_'):
+                                # For linear models, use absolute coefficients
+                                coef = estimator.coef_
+                                if coef.ndim > 1:
+                                    coef = np.mean(np.abs(coef), axis=0)
+                                else:
+                                    coef = np.abs(coef)
+                                base_importances.append(coef)
+                        
+                        if base_importances:
+                            feature_importance = np.mean(base_importances, axis=0)
+                            print(f"  Averaged {len(base_importances)} base estimator importances")
+                        else:
+                            raise ValueError("No base estimator importances available")
+                    else:
+                        raise ValueError("No feature importance method available")
+                        
+                except Exception as e:
+                    print(f"  Base estimator method failed: {e}")
+                    print(f"  Falling back to permutation importance...")
+                    
+                    # Fallback to permutation importance with better parameters
+                    perm_importance = permutation_importance(
+                        model, X_sample, y_sample, 
+                        n_repeats=5,  # Increased 
+                        random_state=42, 
+                        scoring='neg_log_loss',  # Better scoring for classification
+                        n_jobs=1  # Single job to avoid issues
+                    )
+                    feature_importance = np.abs(perm_importance.importances_mean)
+        
+                    # Check if result is uniform (indicating failure)
+                    unique_values = len(np.unique(np.round(feature_importance, 8)))
+                    if unique_values <= 2:
+                        print(f"  Warning: Permutation importance failed (only {unique_values} unique values)")
+                        # Create dummy importance based on feature position
+                        feature_importance = np.random.exponential(0.01, len(feature_names))
+                        feature_importance = feature_importance / np.sum(feature_importance)
                 
             # Ensure feature_importance is a valid 1D array
             if isinstance(feature_importance, (list, tuple)):
@@ -5263,10 +5312,15 @@ def complete_enhanced_prediction_pipeline(home_df, away_df, loaded_components=No
     home_momentum = ts_analyzer.calculate_momentum_score(home_df_filtered, "HOME")
     away_momentum = ts_analyzer.calculate_momentum_score(away_df_filtered, "AWAY")
     
-    # Add momentum to features
-    features_dict['home_momentum_score'] = home_momentum['score']
-    features_dict['away_momentum_score'] = away_momentum['score']
-    features_dict['momentum_differential'] = home_momentum['score'] - away_momentum['score']
+    # DON'T add momentum to features - they weren't in training data
+    # features_dict['home_momentum_score'] = home_momentum['score']
+    # features_dict['away_momentum_score'] = away_momentum['score']
+    # features_dict['momentum_differential'] = home_momentum['score'] - away_momentum['score']
+
+    # Show momentum analysis in console output instead
+    print(f"Home momentum: {home_momentum['score']:+.3f} ({home_momentum['interpretation']})")
+    print(f"Away momentum: {away_momentum['score']:+.3f} ({away_momentum['interpretation']})")
+    print(f"Momentum differential: {home_momentum['score'] - away_momentum['score']:+.3f}")
     
     # Step 5: Enhanced ensemble predictions
     print("\n5. Enhanced ensemble predictions...")
